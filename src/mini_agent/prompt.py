@@ -19,6 +19,11 @@ _RANGE_EDIT_HINT = (
     "`read_file` 的 metadata 含行号；编辑时 `target_content` 必须是文件正文，不要带行号前缀。"
 )
 _TEST_AFTER_EDIT_HINT = "修改后如有测试，可通过 `run_shell` 执行 `uv run pytest`，不要自动跑测试。"
+COMPACTION_SUMMARY_PROMPT = (
+    "请将此前的对话与工具结果压缩为一段简洁的中文摘要，供后续回复继续使用。"
+    "保留：用户目标、已修改或读取的文件路径、关键决策、未完成的工作、错误与约束。"
+    "不要调用工具，不要输出列表以外的客套话，只输出摘要正文。"
+)
 
 
 def get_system_prompt(workspace_root: Path, registry: ToolRegistry | None = None) -> str:

@@ -1,4 +1,4 @@
-"""Context window management and historical tool output compaction."""
+"""Legacy dict-history compaction. Token-aware windowing lives in compaction.py."""
 
 import json
 from typing import Any
