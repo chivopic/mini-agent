@@ -1,8 +1,10 @@
 """Unit tests for controlled shell tool and security policies."""
 
+import subprocess
 import sys
 import threading
 from pathlib import Path
+from typing import Any
 
 from mini_agent.models import RunShellInput
 from mini_agent.tools.shell import (
@@ -199,6 +201,42 @@ class TestShellExecution:
         assert result.ok is False
         assert result.metadata.get("user_cancelled") is True
         assert "取消" in (result.error or "")
+
+    def test_cancel_does_not_communicate_from_two_threads(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+        orig = subprocess.Popen.communicate
+
+        def wrapped(
+            self: subprocess.Popen[str], *args: object, **kwargs: object
+        ) -> tuple[str | bytes | None, str | bytes | None]:
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                return orig(self, *args, **kwargs)
+            finally:
+                with lock:
+                    active -= 1
+
+        monkeypatch.setattr(subprocess.Popen, "communicate", wrapped)
+        py_cmd = f'{sys.executable} -c "import time; time.sleep(5)"'
+        cancel = threading.Event()
+        threading.Timer(0.2, cancel.set).start()
+        result = run_shell(
+            RunShellInput(command=py_cmd),
+            workspace_root=tmp_path,
+            confirmed=True,
+            timeout_seconds=10,
+            cancel=cancel,
+        )
+        assert result.ok is False
+        assert result.metadata.get("user_cancelled") is True
+        assert max_active == 1
 
     def test_command_timeout(self, tmp_path: Path) -> None:
         py_cmd = f'{sys.executable} -c "import time; time.sleep(5)"'

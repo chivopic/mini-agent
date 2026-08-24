@@ -7,7 +7,7 @@ import os
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -72,6 +72,10 @@ _ROUNDS_EXCEEDED_MSG = "工具调用轮数已达到上限，请缩小任务范�
 _DOOM_MSG = "检测到重复工具调用"
 
 
+class _DoubleSigintError(Exception):
+    """Second Ctrl-C within 2s after pairing persist; REPL exits the process."""
+
+
 def _debug_log(message: str) -> None:
     if os.environ.get("MINI_AGENT_DEBUG") != "1":
         return
@@ -125,6 +129,7 @@ class Agent:
         self._doom_streak = 0
         self._doom_results: list[ToolResult] = []
         self._doom_fired = False
+        self._stream_text = ""
 
         if session is not None:
             self.session = session
@@ -197,6 +202,7 @@ class Agent:
         self._cancel.set()
 
     def _on_token(self, token: str) -> None:
+        self._stream_text += token
         self.listener.on_event(TokenDelta(token=token))
 
     def _tools_for_turn(self, extra_tools: list[str] | None) -> list[dict[str, Any]]:
@@ -482,6 +488,20 @@ class Agent:
         except Exception as exc:
             return ToolResult(ok=False, content="", error=str(exc))
 
+    def _take_finished_future(
+        self,
+        fut: Future[ToolResult],
+        collected: list[ToolResult | None],
+        idx: int,
+    ) -> None:
+        if collected[idx] is not None:
+            return
+        if fut.done() and not fut.cancelled():
+            try:
+                collected[idx] = fut.result()
+            except Exception as exc:
+                collected[idx] = ToolResult(ok=False, content="", error=str(exc))
+
     def _run_parallel(self, calls: list[FunctionCall]) -> list[ToolResult]:
         for call in calls:
             self._emit_tool_started(call)
@@ -489,6 +509,7 @@ class Agent:
         collected: list[ToolResult | None] = [None] * len(calls)
         workers = min(len(calls), self.config.max_parallel_readonly)
         executor = ThreadPoolExecutor(max_workers=workers)
+        future_to_idx: dict[Future[ToolResult], int] = {}
         try:
             future_to_idx = {
                 executor.submit(self._dispatch_readonly, call): i for i, call in enumerate(calls)
@@ -500,15 +521,15 @@ class Agent:
                         break
                     done, pending = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
                     for fut in done:
-                        idx = future_to_idx[fut]
-                        try:
-                            collected[idx] = fut.result()
-                        except Exception as exc:
-                            collected[idx] = ToolResult(ok=False, content="", error=str(exc))
+                        self._take_finished_future(fut, collected, future_to_idx[fut])
             except KeyboardInterrupt:
                 self.request_cancel()
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            for fut, idx in future_to_idx.items():
+                self._take_finished_future(fut, collected, idx)
+            executor.shutdown(wait=True, cancel_futures=True)
+            for fut, idx in future_to_idx.items():
+                self._take_finished_future(fut, collected, idx)
 
         raw: list[ToolResult] = [
             item if item is not None else _cancelled_result() for item in collected
@@ -526,6 +547,7 @@ class Agent:
     def _create_response(
         self, messages: list[Message], tools: list[dict[str, Any]]
     ) -> LLMResponse | None:
+        self._stream_text = ""
         attempts = 1 + len(self._retry_backoff)
         last_exc: LLMError | None = None
         for attempt in range(attempts):
@@ -548,7 +570,7 @@ class Agent:
                     return None
             except KeyboardInterrupt:
                 self.request_cancel()
-                return None
+                return LLMResponse(text=self._stream_text or None)
         if last_exc is not None:
             raise last_exc
         return None
@@ -576,6 +598,12 @@ class Agent:
         self.listener.on_event(TurnCancelled(response=_CANCELLED_MSG))
         self._persist_session(user_input, turn_usage)
         return _CANCELLED_MSG
+
+    def _finish_cancel(self, user_input: str, turn_usage: UsageStats) -> str:
+        msg = self._end_cancelled(user_input, turn_usage)
+        if self._double_sigint:
+            raise _DoubleSigintError
+        return msg
 
     def _end_finished(self, user_input: str, turn_usage: UsageStats, response: str) -> str:
         self.listener.on_event(TurnFinished(response=response))
@@ -607,7 +635,7 @@ class Agent:
         try:
             for _ in range(self.config.max_tool_rounds):
                 if self._cancel.is_set():
-                    return self._end_cancelled(cleaned_input, turn_usage)
+                    return self._finish_cancel(cleaned_input, turn_usage)
                 if self._doom_fired:
                     return self._end_finished(cleaned_input, turn_usage, _DOOM_MSG)
 
@@ -617,7 +645,7 @@ class Agent:
                 if response is None or self._cancel.is_set():
                     text = response.text if response is not None else None
                     self._append_text_if_any(text)
-                    return self._end_cancelled(cleaned_input, turn_usage)
+                    return self._finish_cancel(cleaned_input, turn_usage)
 
                 turn_usage = turn_usage.add(response.usage)
 
@@ -651,7 +679,7 @@ class Agent:
                 self._save_paired()
 
                 if self._cancel.is_set():
-                    return self._end_cancelled(cleaned_input, turn_usage)
+                    return self._finish_cancel(cleaned_input, turn_usage)
                 if self._doom_fired:
                     return self._end_finished(cleaned_input, turn_usage, _DOOM_MSG)
 
@@ -662,7 +690,7 @@ class Agent:
                 )
                 pending_calls = []
                 self._save_paired()
-                return self._end_cancelled(cleaned_input, turn_usage)
+                return self._finish_cancel(cleaned_input, turn_usage)
 
             return self._end_finished(cleaned_input, turn_usage, _ROUNDS_EXCEEDED_MSG)
         except KeyboardInterrupt:
@@ -673,7 +701,12 @@ class Agent:
                     Message(role="assistant", parts=self._result_parts(pending_calls, results))
                 )
                 self._save_paired()
-            return self._end_cancelled(cleaned_input, turn_usage)
+            msg = self._end_cancelled(cleaned_input, turn_usage)
+            if self._double_sigint:
+                raise
+            return msg
+        except _DoubleSigintError:
+            raise KeyboardInterrupt from None
         except LLMError as exc:
             self.listener.on_event(TurnFailed(error=str(exc)))
             self._drop_unpaired_tool_calls()

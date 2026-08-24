@@ -228,6 +228,7 @@ class OpenAIChatCompletionsClient:
                 except KeyboardInterrupt:
                     if cancel is not None:
                         cancel.set()
+                    raise
                 finally:
                     _close_stream(response_stream)
 

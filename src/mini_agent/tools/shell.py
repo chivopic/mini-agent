@@ -245,27 +245,31 @@ class _ShellCancelledError(Exception):
     """Internal: communicate aborted because cancel was set."""
 
 
-def _terminate_process_group(process: subprocess.Popen[str]) -> None:
-    """SIGTERM the process group, then SIGKILL. Windows: terminate then kill."""
+def _kill_process_group(process: subprocess.Popen[str], *, force: bool = False) -> None:
+    """Signal the process group. Does not communicate (caller may have an in-flight waiter)."""
     if process.poll() is not None:
         return
-
-    def _signal(sig_unix: int, fallback: str) -> None:
-        if hasattr(os, "killpg"):
-            try:
-                os.killpg(os.getpgid(process.pid), sig_unix)
-                return
-            except OSError:
-                pass
+    if hasattr(os, "killpg"):
+        sig = signal.SIGKILL if force else signal.SIGTERM
         try:
-            if fallback == "terminate":
-                process.terminate()
-            else:
-                process.kill()
+            os.killpg(os.getpgid(process.pid), sig)
+            return
         except OSError:
             pass
+    try:
+        if force:
+            process.kill()
+        else:
+            process.terminate()
+    except OSError:
+        pass
 
-    _signal(signal.SIGTERM, "terminate")
+
+def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+    """Timeout path: SIGTERM, communicate 2s, SIGKILL, communicate."""
+    if process.poll() is not None:
+        return
+    _kill_process_group(process, force=False)
     try:
         process.communicate(timeout=2)
         return
@@ -273,11 +277,24 @@ def _terminate_process_group(process: subprocess.Popen[str]) -> None:
         pass
     except Exception:
         pass
-    _signal(signal.SIGKILL, "kill")
+    _kill_process_group(process, force=True)
     try:
         process.communicate(timeout=2)
     except Exception:
         pass
+
+
+def _signal_and_join_waiter(
+    process: subprocess.Popen[str],
+    done: threading.Event,
+    thread: threading.Thread,
+) -> None:
+    """Cancel/KI: only signal; wait for the waiter thread's in-flight communicate."""
+    _kill_process_group(process, force=False)
+    if not done.wait(2):
+        _kill_process_group(process, force=True)
+        done.wait(3)
+    thread.join(timeout=1)
 
 
 def _communicate(
@@ -285,7 +302,7 @@ def _communicate(
     timeout_seconds: int,
     cancel: threading.Event | None,
 ) -> tuple[str, str]:
-    """Wait for stdout/stderr. Cancel uses the same kill path as TimeoutExpired."""
+    """Wait for stdout/stderr. Cancel signals only; timeout may communicate after."""
     if cancel is None:
         return process.communicate(timeout=timeout_seconds)
 
@@ -305,18 +322,16 @@ def _communicate(
     try:
         while not done.wait(0.05):
             if cancel.is_set():
-                _terminate_process_group(process)
-                done.wait(3)
+                _signal_and_join_waiter(process, done, thread)
                 raise _ShellCancelledError
     except KeyboardInterrupt:
         if cancel is not None:
             cancel.set()
-        _terminate_process_group(process)
-        done.wait(3)
+        _signal_and_join_waiter(process, done, thread)
         raise
 
     if cancel.is_set():
-        _terminate_process_group(process)
+        _kill_process_group(process, force=True)
         raise _ShellCancelledError
     if "exc" in box:
         raise box["exc"]  # type: ignore[misc]

@@ -5,6 +5,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import pytest
 from pydantic import BaseModel, Field
 
 from mini_agent.agent import Agent
@@ -514,6 +515,50 @@ class SleepTool:
         return "read:sleep"
 
 
+class FastInput(BaseModel):
+    x: int = 0
+
+
+class FastTool:
+    name = "fast_tool"
+    description = "立即返回。"
+    permission = PermissionClass.READ
+    kind = ToolKind.READONLY
+    input_model = FastInput
+
+    def execute(self, inp: FastInput, ctx: ToolContext) -> ToolResult:
+        return ToolResult(ok=True, content="fast-ok")
+
+    def format_call(self, inp: FastInput) -> str:
+        return "fast_tool"
+
+    def approval_pattern(self, inp: FastInput) -> str:
+        return "read:fast"
+
+
+class GateTool:
+    name = "gate_tool"
+    description = "等待取消。"
+    permission = PermissionClass.READ
+    kind = ToolKind.READONLY
+    input_model = FastInput
+
+    def __init__(self, started: threading.Event) -> None:
+        self.started = started
+
+    def execute(self, inp: FastInput, ctx: ToolContext) -> ToolResult:
+        self.started.set()
+        if ctx.cancel.wait(timeout=5):
+            raise ToolCancelled
+        return ToolResult(ok=True, content="gate-ok")
+
+    def format_call(self, inp: FastInput) -> str:
+        return "gate_tool"
+
+    def approval_pattern(self, inp: FastInput) -> str:
+        return "read:gate"
+
+
 class TestAgentPr4Loop:
     def test_parallel_read_file_persists_in_call_order(
         self, tmp_path: Path, monkeypatch: Any
@@ -632,6 +677,69 @@ class TestAgentPr4Loop:
         clock["t"] = 110.0
         agent.request_cancel()
         assert agent._double_sigint is False
+
+    def test_llm_keyboard_interrupt_counts_sigint(self, tmp_path: Path) -> None:
+        class InterruptLLM(FakeLLMClient):
+            def create_response(
+                self,
+                messages: list[Message],
+                tools: list[dict[str, Any]],
+                model: str = "gpt-4o-mini",
+                on_token: Callable[[str], None] | None = None,
+                cancel: threading.Event | None = None,
+            ) -> LLMResponse:
+                raise KeyboardInterrupt
+
+        clock = {"t": 50.0}
+        agent = Agent(
+            config=AgentConfig(workspace_root=tmp_path),
+            llm_client=InterruptLLM([]),
+            monotonic=lambda: clock["t"],
+        )
+        answer = agent.step("hi")
+        assert "取消" in answer
+        assert agent._last_sigint_at == 50.0
+        assert agent._double_sigint is False
+        clock["t"] = 51.0
+        with pytest.raises(KeyboardInterrupt):
+            agent.step("again")
+
+    def test_parallel_cancel_keeps_finished_results(self, tmp_path: Path) -> None:
+        started = threading.Event()
+        registry = default_registry()
+        registry.register(FastTool())
+        registry.register(GateTool(started))
+        fake_llm = FakeLLMClient(
+            [
+                LLMResponse(
+                    function_calls=[
+                        FunctionCall(name="fast_tool", call_id="call_fast", arguments="{}"),
+                        FunctionCall(name="gate_tool", call_id="call_gate", arguments="{}"),
+                    ]
+                ),
+                LLMResponse(text="should not run"),
+            ]
+        )
+        agent = Agent(
+            config=AgentConfig(workspace_root=tmp_path),
+            llm_client=fake_llm,
+            registry=registry,
+        )
+
+        def cancel_soon() -> None:
+            started.wait(timeout=2)
+            agent.request_cancel()
+
+        thread = threading.Thread(target=cancel_soon)
+        thread.start()
+        agent.step("go")
+        thread.join(timeout=2)
+        results = _result_parts(agent.messages)
+        by_id = {part.call_id: part for part in results}
+        assert by_id["call_fast"].ok is True
+        assert "fast-ok" in by_id["call_fast"].content
+        assert by_id["call_gate"].ok is False
+        assert by_id["call_gate"].error == "用户取消"
 
     def test_doom_does_not_fire_on_three_successful_list_files(self, tmp_path: Path) -> None:
         infinite_responses = [

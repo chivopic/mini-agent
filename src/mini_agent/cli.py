@@ -488,6 +488,10 @@ def repl_loop(agent: Agent, console: Console) -> None:
         try:
             user_input = Prompt.ask("[bold cyan]>[/bold cyan]", console=console).strip()
         except KeyboardInterrupt:
+            agent.request_cancel()
+            if agent._double_sigint:
+                console.print("\n[dim]👋 再见！[/dim]")
+                raise typer.Exit(code=0) from None
             console.print("\n[yellow]已取消当前输入[/yellow]")
             continue
         except EOFError:
@@ -707,6 +711,9 @@ def repl_loop(agent: Agent, console: Console) -> None:
             agent.step(user_input)
         except KeyboardInterrupt:
             agent.request_cancel()
+            if agent._double_sigint:
+                console.print("\n[dim]👋 再见！[/dim]")
+                raise typer.Exit(code=0) from None
             console.print("\n[yellow]已取消当前回合[/yellow]")
         except NonInteractiveAskError as exc:
             console.print(
