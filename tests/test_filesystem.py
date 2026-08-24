@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from mini_agent.models import (
     AgentConfig,
     EditFileInput,
+    GetRepoMapInput,
     ListFilesInput,
     ReadFileInput,
     SearchCodeInput,
@@ -16,6 +17,7 @@ from mini_agent.models import (
 )
 from mini_agent.tools.filesystem import (
     edit_file,
+    get_repo_map,
     list_files,
     read_file,
     resolve_relative_path,
@@ -365,3 +367,17 @@ class TestSearchCode:
         res = search_code(inp, workspace_root=tmp_path)
         assert res.ok is False
         assert "正则表达式格式错误" in (res.error or "")
+
+
+class TestGetRepoMapSandbox:
+    """get_repo_map must stay inside the workspace via resolve_relative_path."""
+
+    def test_reject_parent_traversal(self, tmp_path: Path) -> None:
+        result = get_repo_map(GetRepoMapInput(path="../"), workspace_root=tmp_path)
+        assert result.ok is False
+        assert "越界" in (result.error or "")
+
+    def test_reject_absolute_path(self, tmp_path: Path) -> None:
+        result = get_repo_map(GetRepoMapInput(path=str(tmp_path)), workspace_root=tmp_path)
+        assert result.ok is False
+        assert "非法绝对路径" in (result.error or "")

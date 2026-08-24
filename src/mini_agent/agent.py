@@ -1,6 +1,7 @@
 """Agent loop, history management, session persistence, usage tracking, and tool dispatching."""
 
 import json
+import threading
 from datetime import datetime
 from typing import Any, Protocol
 
@@ -8,7 +9,7 @@ from pydantic import ValidationError
 
 from mini_agent.context import compact_history
 from mini_agent.cost import UsageStats, calculate_cost_cny
-from mini_agent.llm import LLMClient, get_system_prompt, get_tool_definitions
+from mini_agent.llm import LLMClient
 from mini_agent.messages import (
     Message,
     TextPart,
@@ -17,26 +18,17 @@ from mini_agent.messages import (
     history_v1_to_messages,
     messages_to_v1_history,
 )
-from mini_agent.models import (
-    AgentConfig,
-    EditFileInput,
-    GetRepoMapInput,
-    ListFilesInput,
-    ReadFileInput,
-    RunShellInput,
-    SearchCodeInput,
-    ToolResult,
-    WriteFileInput,
-)
-from mini_agent.repomap import generate_repo_map
+from mini_agent.models import AgentConfig, RunShellInput, ToolResult
+from mini_agent.prompt import get_system_prompt
 from mini_agent.session import (
     SessionData,
     SessionMeta,
     generate_session_id,
     save_session,
 )
-from mini_agent.tools.filesystem import edit_file, list_files, read_file, search_code, write_file
-from mini_agent.tools.shell import check_command_safety, run_shell
+from mini_agent.tools import ToolRegistry, default_registry
+from mini_agent.tools.protocol import ToolContext
+from mini_agent.tools.shell import check_command_safety
 
 
 class AgentEventListener(Protocol):
@@ -84,11 +76,14 @@ class Agent:
         llm_client: LLMClient,
         listener: AgentEventListener | None = None,
         session: SessionData | None = None,
+        registry: ToolRegistry | None = None,
     ) -> None:
         self.config = config
         self.llm_client = llm_client
         self.listener = listener
-        self.tools = get_tool_definitions()
+        self.registry = registry or default_registry()
+        self._cancel = threading.Event()
+        self.tools = self.registry.json_schemas()
 
         if session is not None:
             self.session = session
@@ -107,7 +102,9 @@ class Agent:
             self.messages = [
                 Message(
                     role="system",
-                    parts=[TextPart(text=get_system_prompt(self.config.workspace_root))],
+                    parts=[
+                        TextPart(text=get_system_prompt(self.config.workspace_root, self.registry))
+                    ],
                     created_at=now_iso,
                 )
             ]
@@ -137,116 +134,18 @@ class Agent:
 
     def _execute_tool(self, name: str, raw_arguments: str) -> ToolResult:
         """Parse arguments and dispatch execution to the corresponding tool."""
-        try:
-            args = json.loads(raw_arguments) if raw_arguments.strip() else {}
-        except json.JSONDecodeError as exc:
-            return ToolResult(
-                ok=False,
-                content="",
-                error=f"工具参数不是合法的 JSON 字符串: {exc}",
-            )
-
-        if not isinstance(args, dict):
-            return ToolResult(
-                ok=False,
-                content="",
-                error=f"工具参数必须为 JSON 对象 (dict)，收到: {type(args).__name__}",
-            )
-
-        if name == "get_repo_map":
-            try:
-                inp = GetRepoMapInput(**args)
-                target_dir = self.config.workspace_root / inp.path
-                if not target_dir.exists():
-                    return ToolResult(
-                        ok=False,
-                        content="",
-                        error=f"指定的目录不存在: '{inp.path}'",
-                        metadata={"path": inp.path},
-                    )
-                repo_map = generate_repo_map(target_dir)
-                return ToolResult(
-                    ok=True,
-                    content=repo_map if repo_map else "未在当前目录发现有效的代码文件与符号。",
-                    metadata={"path": inp.path},
-                )
-            except ValidationError as exc:
-                return ToolResult(
-                    ok=False,
-                    content="",
-                    error=f"get_repo_map 参数校验失败: {exc}",
-                )
-
-        if name == "search_code":
-            try:
-                inp = SearchCodeInput(**args)
-                return search_code(
-                    inp,
-                    workspace_root=self.config.workspace_root,
-                    max_output_chars=self.config.max_output_chars,
-                )
-            except ValidationError as exc:
-                return ToolResult(
-                    ok=False,
-                    content="",
-                    error=f"search_code 参数校验失败: {exc}",
-                )
-
-        if name == "read_file":
-            try:
-                inp = ReadFileInput(**args)
-                return read_file(
-                    inp,
-                    workspace_root=self.config.workspace_root,
-                    max_output_chars=self.config.max_output_chars,
-                )
-            except ValidationError as exc:
-                return ToolResult(
-                    ok=False,
-                    content="",
-                    error=f"read_file 参数校验失败: {exc}",
-                )
-
-        if name == "list_files":
-            try:
-                inp = ListFilesInput(**args)
-                return list_files(
-                    inp,
-                    workspace_root=self.config.workspace_root,
-                    max_output_chars=self.config.max_output_chars,
-                )
-            except ValidationError as exc:
-                return ToolResult(
-                    ok=False,
-                    content="",
-                    error=f"list_files 参数校验失败: {exc}",
-                )
-
-        if name == "write_file":
-            try:
-                inp = WriteFileInput(**args)
-                return write_file(inp, workspace_root=self.config.workspace_root)
-            except ValidationError as exc:
-                return ToolResult(
-                    ok=False,
-                    content="",
-                    error=f"write_file 参数校验失败: {exc}",
-                )
-
-        if name == "edit_file":
-            try:
-                inp = EditFileInput(**args)
-                return edit_file(inp, workspace_root=self.config.workspace_root)
-            except ValidationError as exc:
-                return ToolResult(
-                    ok=False,
-                    content="",
-                    error=f"edit_file 参数校验失败: {exc}",
-                )
+        tool = self.registry.get(name)
+        if tool is None:
+            return ToolResult(ok=False, content="", error=f"未知的工具名称: '{name}'")
 
         if name == "run_shell":
+            inp = None
             try:
-                inp = RunShellInput(**args)
+                args = json.loads(raw_arguments) if raw_arguments.strip() else {}
+                inp = RunShellInput(**args) if isinstance(args, dict) else None
+            except (json.JSONDecodeError, ValidationError):
+                inp = None
+            if inp is not None:
                 is_blocked, req_conf, reason = check_command_safety(inp.command)
                 if is_blocked:
                     return ToolResult(
@@ -255,13 +154,13 @@ class Agent:
                         error=reason,
                         metadata={"blocked": True, "command": inp.command},
                     )
-
                 if req_conf:
-                    confirmed = False
-                    if self.listener and hasattr(self.listener, "on_tool_confirm"):
-                        confirmed = self.listener.on_tool_confirm(inp.command)
-
-                    if not confirmed:
+                    allowed = bool(
+                        self.listener
+                        and hasattr(self.listener, "on_tool_confirm")
+                        and self.listener.on_tool_confirm(inp.command)
+                    )
+                    if not allowed:
                         return ToolResult(
                             ok=False,
                             content="",
@@ -269,25 +168,8 @@ class Agent:
                             metadata={"user_cancelled": True, "command": inp.command},
                         )
 
-                return run_shell(
-                    inp,
-                    workspace_root=self.config.workspace_root,
-                    confirmed=True,
-                    timeout_seconds=self.config.shell_timeout_seconds,
-                    max_output_chars=self.config.max_output_chars,
-                )
-            except ValidationError as exc:
-                return ToolResult(
-                    ok=False,
-                    content="",
-                    error=f"run_shell 参数校验失败: {exc}",
-                )
-
-        return ToolResult(
-            ok=False,
-            content="",
-            error=f"未知的工具名称: '{name}'",
-        )
+        ctx = ToolContext(self.config.workspace_root, self.config, self._cancel)
+        return self.registry.dispatch(name, raw_arguments, ctx)
 
     def _persist_session(self, user_input: str, turn_usage: UsageStats) -> None:
         """Update metadata, usage counters, and auto-save session."""

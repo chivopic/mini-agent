@@ -8,8 +8,9 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from mini_agent.models import RunShellInput, ToolResult
+from mini_agent.models import PermissionClass, RunShellInput, ToolResult
 from mini_agent.tools.filesystem import truncate_text
+from mini_agent.tools.protocol import ToolContext, ToolKind
 
 # High-risk patterns that must be blocked outright
 BLOCKLIST_PATTERNS = [
@@ -277,3 +278,26 @@ def run_shell(
         error=error_msg,
         metadata=metadata,
     )
+
+
+class RunShellTool:
+    name = "run_shell"
+    description = "在工作区根目录下执行受控的 Shell 命令行指令。"
+    permission = PermissionClass.SHELL
+    kind = ToolKind.MUTATING
+    input_model = RunShellInput
+
+    def execute(self, inp: RunShellInput, ctx: ToolContext) -> ToolResult:
+        return run_shell(
+            inp,
+            workspace_root=ctx.workspace_root,
+            confirmed=True,
+            timeout_seconds=ctx.config.shell_timeout_seconds,
+            max_output_chars=ctx.config.max_output_chars,
+        )
+
+    def format_call(self, inp: RunShellInput) -> str:
+        return f"run_shell command={inp.command}"
+
+    def approval_pattern(self, inp: RunShellInput) -> str:
+        return inp.command
