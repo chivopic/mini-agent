@@ -119,17 +119,88 @@ def resolve_relative_path(
     return resolved_path, None
 
 
+_READ_CHUNK = 64 * 1024
+
+
 def _text_line_count(text: str) -> int:
     if not text:
         return 0
     return text.count("\n") + (0 if text.endswith("\n") else 1)
 
 
-def _utf8_prefix(text: str, max_bytes: int) -> str:
-    encoded = text.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return text
-    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+class _BinLines:
+    """Binary line scanner that can unread leftover bytes without seeking."""
+
+    def __init__(self, handle: Any) -> None:
+        self._handle = handle
+        self._buf = b""
+
+    def _read(self, n: int) -> bytes:
+        if n <= 0:
+            return b""
+        if self._buf:
+            take = self._buf[:n]
+            self._buf = self._buf[n:]
+            if len(take) < n:
+                take += self._handle.read(n - len(take))
+            return take
+        return self._handle.read(n)
+
+    def _unread(self, data: bytes) -> None:
+        if data:
+            self._buf = data + self._buf
+
+    def skip_line(self) -> bool:
+        """Skip one line. False if already at EOF."""
+        found = False
+        while True:
+            chunk = self._read(_READ_CHUNK)
+            if not chunk:
+                return found
+            found = True
+            idx = chunk.find(b"\n")
+            if idx != -1:
+                self._unread(chunk[idx + 1 :])
+                return True
+
+    def read_line(self, max_bytes: int | None) -> tuple[bytes, bool]:
+        """Read one line, optionally capped. ``(b'', False)`` at EOF.
+
+        The bool is True when ``max_bytes`` was hit before a newline.
+        """
+        if max_bytes is not None and max_bytes <= 0:
+            return b"", True
+        parts: list[bytes] = []
+        got = 0
+        while True:
+            to_read = _READ_CHUNK if max_bytes is None else min(_READ_CHUNK, max_bytes - got)
+            if to_read <= 0:
+                return b"".join(parts), True
+            chunk = self._read(to_read)
+            if not chunk:
+                return b"".join(parts), False
+            idx = chunk.find(b"\n")
+            if idx != -1:
+                parts.append(chunk[: idx + 1])
+                self._unread(chunk[idx + 1 :])
+                return b"".join(parts), False
+            parts.append(chunk)
+            got += len(chunk)
+
+    def count_remaining_lines(self) -> int:
+        count = 0
+        any_data = False
+        ends_with_nl = True
+        while True:
+            chunk = self._read(_READ_CHUNK)
+            if not chunk:
+                break
+            any_data = True
+            count += chunk.count(b"\n")
+            ends_with_nl = chunk.endswith(b"\n")
+        if any_data and not ends_with_nl:
+            count += 1
+        return count
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -158,40 +229,52 @@ def _read_text_range(
     line_budget = max_lines if limit is None else min(limit, max_lines)
     collected: list[str] = []
     nbytes = 0
-    total_lines = 0
+    line_no = 0
     end_line = start_line - 1
-    collecting = True
-    stopped_for_lines = False
     stopped_for_bytes = False
+    truncated_mid_line = False
 
-    with open(resolved_path, encoding="utf-8", errors="strict") as handle:
-        for line_no, line in enumerate(handle, start=1):
-            total_lines = line_no
-            if not collecting:
-                continue
-            if line_no < start_line:
-                continue
-            if len(collected) >= line_budget:
-                collecting = False
-                stopped_for_lines = True
-                continue
-            encoded = line.encode("utf-8")
-            if collected and nbytes + len(encoded) > max_bytes:
-                collecting = False
+    with open(resolved_path, "rb") as raw_handle:
+        scanner = _BinLines(raw_handle)
+        while line_no < start_line - 1:
+            if not scanner.skip_line():
+                break
+            line_no += 1
+
+        while len(collected) < line_budget:
+            remaining = max_bytes - nbytes
+            if remaining <= 0:
                 stopped_for_bytes = True
-                continue
-            if not collected and len(encoded) > max_bytes:
-                prefix = _utf8_prefix(line, max_bytes)
-                collected.append(prefix)
-                nbytes = len(prefix.encode("utf-8"))
-                end_line = line_no
-                collecting = False
+                break
+            raw, hit_cap = scanner.read_line(remaining)
+            if not raw:
+                break
+            line_no += 1
+            if hit_cap:
                 stopped_for_bytes = True
-                continue
-            collected.append(line)
-            nbytes += len(encoded)
+                truncated_mid_line = True
+                if not collected:
+                    collected.append(raw.decode("utf-8", errors="ignore"))
+                    end_line = line_no
+                break
+            collected.append(raw.decode("utf-8"))
+            nbytes += len(raw)
             end_line = line_no
 
+        if truncated_mid_line:
+            scanner.skip_line()
+        extra = scanner.count_remaining_lines()
+
+    total_lines = line_no + extra
+    if offset is not None and start_line > total_lines:
+        return "", {
+            "truncated": False,
+            "start_line": start_line,
+            "total_lines": total_lines,
+            "offset_past_eof": True,
+        }
+
+    stopped_for_lines = extra > 0 and len(collected) >= line_budget and not stopped_for_bytes
     truncated = stopped_for_bytes or (stopped_for_lines and (limit is None or limit > max_lines))
     return "".join(collected), {
         "truncated": truncated,
@@ -250,7 +333,8 @@ def read_file(
             content="",
             error=(
                 f"文件体积过大 ({size} 字节，上限 {max_file_bytes} 字节): '{input_data.path}'，"
-                "请指定更小文件。"
+                "请指定更小文件，或使用 offset/limit 按行区间读取"
+                f"（例如 offset=1, limit={RANGE_MAX_LINES}）。"
             ),
             metadata={"path": input_data.path, "size_bytes": size, "truncated": False},
         )
@@ -262,15 +346,22 @@ def read_file(
                 offset=input_data.offset,
                 limit=input_data.limit,
             )
+            offset_past_eof = range_meta.pop("offset_past_eof", False)
+            metadata = {"path": input_data.path, "size_bytes": size, **range_meta}
+            if offset_past_eof:
+                start = range_meta.get("start_line")
+                total = range_meta.get("total_lines", 0)
+                return ToolResult(
+                    ok=False,
+                    content="",
+                    error=(f"起始行 {start} 超出文件末尾 (共 {total} 行): '{input_data.path}'。"),
+                    metadata=metadata,
+                )
             return ToolResult(
                 ok=True,
                 content=content,
                 error=None,
-                metadata={
-                    "path": input_data.path,
-                    "size_bytes": size,
-                    **range_meta,
-                },
+                metadata=metadata,
             )
 
         with open(resolved_path, encoding="utf-8", errors="strict") as f:
@@ -292,18 +383,20 @@ def read_file(
 
     total_lines = _text_line_count(raw_content)
     content, truncated = truncate_text(raw_content, max_chars=max_output_chars)
+    metadata: dict[str, Any] = {
+        "path": input_data.path,
+        "size_bytes": size,
+        "truncated": truncated,
+        "total_lines": total_lines,
+    }
+    if not truncated:
+        metadata["start_line"] = 1
+        metadata["end_line"] = total_lines
     return ToolResult(
         ok=True,
         content=content,
         error=None,
-        metadata={
-            "path": input_data.path,
-            "size_bytes": size,
-            "truncated": truncated,
-            "start_line": 1,
-            "end_line": total_lines,
-            "total_lines": total_lines,
-        },
+        metadata=metadata,
     )
 
 

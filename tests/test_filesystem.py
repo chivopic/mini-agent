@@ -234,6 +234,71 @@ class TestReadFileTool:
         assert len(result.content.encode("utf-8")) <= 100 * 1024
         assert "L001:" not in result.content
 
+    def test_ranged_read_survives_invalid_utf8_after_window(self, tmp_path: Path) -> None:
+        (tmp_path / "mixed.txt").write_bytes(b"aaa\nbbb\nccc\n\xff")
+        result = read_file(
+            ReadFileInput(path="mixed.txt", offset=1, limit=2),
+            workspace_root=tmp_path,
+        )
+        assert result.ok is True
+        assert result.content == "aaa\nbbb\n"
+        assert "L001:" not in result.content
+        assert result.metadata["start_line"] == 1
+        assert result.metadata["end_line"] == 2
+        assert result.metadata["total_lines"] == 4
+
+    def test_ranged_read_bounds_first_line_to_100kib(self, tmp_path: Path) -> None:
+        (tmp_path / "huge.txt").write_bytes(b"A" * (100 * 1024 + 50) + b"\nsecond\n")
+        result = read_file(
+            ReadFileInput(path="huge.txt", offset=1, limit=2),
+            workspace_root=tmp_path,
+        )
+        assert result.ok is True
+        assert len(result.content.encode("utf-8")) <= 100 * 1024
+        assert result.content == "A" * (100 * 1024)
+        assert "second" not in result.content
+        assert result.metadata["truncated"] is True
+        assert result.metadata["start_line"] == 1
+        assert result.metadata["end_line"] == 1
+        assert result.metadata["total_lines"] == 2
+
+    def test_ranged_read_offset_past_eof(self, tmp_path: Path) -> None:
+        (tmp_path / "short.txt").write_text("a\nb\nc\n", encoding="utf-8")
+        result = read_file(
+            ReadFileInput(path="short.txt", offset=10, limit=2),
+            workspace_root=tmp_path,
+        )
+        assert result.ok is False
+        assert "超出" in (result.error or "")
+        assert "末尾" in (result.error or "")
+        assert result.content == ""
+        assert result.metadata["total_lines"] == 3
+        assert result.metadata["start_line"] == 10
+        assert "end_line" not in result.metadata
+
+    def test_read_oversized_file_hints_offset_limit(self, tmp_path: Path) -> None:
+        big_file = tmp_path / "big.txt"
+        big_file.write_text("A" * 1500, encoding="utf-8")
+        result = read_file(
+            ReadFileInput(path="big.txt"),
+            workspace_root=tmp_path,
+            max_file_bytes=1000,
+        )
+        assert result.ok is False
+        assert "体积过大" in (result.error or "")
+        assert "offset" in (result.error or "")
+        assert "limit" in (result.error or "")
+
+    def test_unranged_head_tail_omits_span_metadata(self, tmp_path: Path) -> None:
+        (tmp_path / "mid.txt").write_text("a" * 13_000, encoding="utf-8")
+        result = read_file(ReadFileInput(path="mid.txt"), workspace_root=tmp_path)
+        assert result.ok is True
+        assert result.metadata["truncated"] is True
+        assert "已省略" in result.content
+        assert "start_line" not in result.metadata
+        assert "end_line" not in result.metadata
+        assert result.metadata["total_lines"] == 1
+
 
 class TestListFilesTool:
     """Test list_files tool behavior."""

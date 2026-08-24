@@ -83,12 +83,18 @@ class ReadFileInput(BaseModel):
     offset: int | None = Field(
         default=None,
         ge=1,
-        description="1-based start line. Omit with limit to start at line 1.",
+        description=(
+            "1-based start line; omit to start at line 1. "
+            "Providing offset and/or limit selects ranged read (max 400 lines / 100 KiB)."
+        ),
     )
     limit: int | None = Field(
         default=None,
         ge=1,
-        description="Maximum number of lines to return from offset.",
+        description=(
+            "Maximum number of lines to return from offset. "
+            "Providing offset and/or limit selects ranged read (max 400 lines / 100 KiB)."
+        ),
     )
 
 
