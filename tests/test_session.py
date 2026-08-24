@@ -4,7 +4,15 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from mini_agent.messages import TextPart, history_v1_to_messages
+import pytest
+
+from mini_agent.messages import (
+    Message,
+    TextPart,
+    ToolCallPart,
+    UnpairedToolError,
+    history_v1_to_messages,
+)
 from mini_agent.session import (
     SessionData,
     SessionMeta,
@@ -282,3 +290,98 @@ def test_default_sessions_dir_chmod_mini_agent_home(tmp_path: Path, monkeypatch:
     assert sessions_dir == home_dir / "sessions"
     assert home_dir.is_dir()
     assert (home_dir.stat().st_mode & 0o777) == 0o700
+
+
+def _v1_meta(session_id: str, workspace_root: str) -> dict:
+    return {
+        "session_id": session_id,
+        "workspace_root": workspace_root,
+        "created_at": "2026-08-18T10:00:00",
+        "updated_at": "2026-08-18T10:00:00",
+        "model": "gpt-4o",
+        "title": "坏文件",
+        "turn_count": 1,
+    }
+
+
+def test_load_v1_malformed_history_returns_none(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    ws = tmp_path.as_posix()
+
+    cases: list[tuple[str, object]] = [
+        ("hist_str", "oops"),
+        ("hist_null", [None]),
+    ]
+    for sid, history in cases:
+        payload = {"meta": _v1_meta(sid, ws), "history": history}
+        (sessions_dir / f"{sid}.json").write_text(json.dumps(payload), encoding="utf-8")
+        assert load_session(sid, sessions_dir=sessions_dir) is None
+
+
+def test_save_session_rejects_unpaired_tool_calls(tmp_path: Path) -> None:
+    sid = "unpaired_save"
+    session = SessionData(
+        meta=SessionMeta(
+            session_id=sid,
+            workspace_root=tmp_path.as_posix(),
+            created_at="2026-08-18T10:00:00",
+            updated_at="2026-08-18T10:00:00",
+            model="gpt-4o",
+            title="未配对",
+            turn_count=1,
+        ),
+        messages=[
+            Message(
+                role="assistant",
+                parts=[ToolCallPart(call_id="c1", name="read_file", arguments="{}")],
+                created_at="2026-08-18T10:00:00",
+            )
+        ],
+    )
+    with pytest.raises(UnpairedToolError):
+        save_session(session, sessions_dir=tmp_path)
+    assert not (tmp_path / f"{sid}.json").exists()
+    assert not (tmp_path / f"{sid}.tmp").exists()
+    assert load_session(sid, sessions_dir=tmp_path) is None
+
+
+def test_list_sessions_skips_unloadable_files(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    ws = tmp_path.resolve().as_posix()
+
+    good = SessionData(
+        meta=SessionMeta(
+            session_id="good",
+            workspace_root=ws,
+            created_at="2026-08-18T12:00:00",
+            updated_at="2026-08-18T12:00:00",
+            model="gpt-4o",
+            title="可恢复",
+            turn_count=1,
+        )
+    )
+    save_session(good, sessions_dir=sessions_dir)
+
+    unpaired = SessionData(
+        schema_version=2,
+        meta=SessionMeta.model_validate(_v1_meta("unpaired_list", ws)),
+        messages=[
+            Message(
+                role="assistant",
+                parts=[ToolCallPart(call_id="c1", name="read_file", arguments="{}")],
+                created_at="2026-08-18T10:00:00",
+            )
+        ],
+    )
+    (sessions_dir / "unpaired_list.json").write_text(unpaired.model_dump_json(), encoding="utf-8")
+
+    bad_v1 = {"meta": _v1_meta("hist_str_list", ws), "history": "oops"}
+    (sessions_dir / "hist_str_list.json").write_text(json.dumps(bad_v1), encoding="utf-8")
+
+    listed = list_sessions(sessions_dir=sessions_dir)
+    ids = {m.session_id for m in listed}
+    assert ids == {"good"}
+    assert load_session("unpaired_list", sessions_dir=sessions_dir) is None
+    assert load_session("hist_str_list", sessions_dir=sessions_dir) is None

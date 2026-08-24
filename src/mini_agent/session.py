@@ -71,6 +71,8 @@ def generate_session_id() -> str:
 
 def save_session(session: SessionData, sessions_dir: Path | None = None) -> Path:
     """Save session data to a JSON file atomically."""
+    assert_pairing(session.messages)
+
     target_dir = sessions_dir or get_default_sessions_dir()
     target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -102,14 +104,26 @@ def load_session(session_id: str, sessions_dir: Path | None = None) -> SessionDa
     try:
         if version == 1:
             meta = SessionMeta.model_validate(data["meta"])
-            messages = history_v1_to_messages(data.get("history") or [], created_at=meta.created_at)
+            raw_history = data.get("history") or []
+            if not isinstance(raw_history, list) or not all(
+                isinstance(item, dict) for item in raw_history
+            ):
+                return None
+            messages = history_v1_to_messages(raw_history, created_at=meta.created_at)
             return SessionData(schema_version=2, meta=meta, messages=messages, permission_memory=[])
         if version == 2:
             sess = SessionData.model_validate(data)
             assert_pairing(sess.messages)
             return sess
         return None
-    except (UnpairedToolError, ValidationError, KeyError, AssertionError):
+    except (
+        UnpairedToolError,
+        ValidationError,
+        KeyError,
+        AssertionError,
+        TypeError,
+        AttributeError,
+    ):
         return None
 
 
@@ -126,15 +140,12 @@ def list_sessions(
     resolved_ws = workspace_root.resolve().as_posix() if workspace_root else None
 
     for file_path in target_dir.glob("*.json"):
-        try:
-            with open(file_path, encoding="utf-8") as f:
-                data = json.load(f)
-            meta_dict = data.get("meta", {})
-            meta = SessionMeta.model_validate(meta_dict)
-            if resolved_ws is None or meta.workspace_root == resolved_ws:
-                sessions.append(meta)
-        except Exception:
+        loaded = load_session(file_path.stem, sessions_dir=target_dir)
+        if loaded is None:
             continue
+        meta = loaded.meta
+        if resolved_ws is None or meta.workspace_root == resolved_ws:
+            sessions.append(meta)
 
     sessions.sort(key=lambda s: s.updated_at, reverse=True)
     return sessions
