@@ -36,7 +36,7 @@ def test_limits_default_max_output_chars_is_12000() -> None:
 
 def test_agent_config_defaults_without_app_config(tmp_path: Path) -> None:
     config = AgentConfig(workspace_root=tmp_path)
-    assert config.max_tool_rounds == 8
+    assert config.max_tool_rounds == 32
     assert config.max_output_chars == 12_000
     assert config.model == "gpt-4o-mini"
 
