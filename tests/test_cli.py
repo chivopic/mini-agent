@@ -3,8 +3,12 @@
 import re
 from datetime import datetime
 from pathlib import Path
+from subprocess import CompletedProcess
+from typing import Any
 from unittest.mock import patch
 
+import pytest
+import typer
 from rich.console import Console
 from typer.testing import CliRunner
 
@@ -16,8 +20,9 @@ from mini_agent.cli import (
     render_sessions_table,
     run_cli,
 )
-from mini_agent.llm import LLMClient, LLMResponse
+from mini_agent.llm import FunctionCall, LLMClient, LLMResponse
 from mini_agent.models import ToolResult
+from mini_agent.permission import Reply
 from mini_agent.session import SessionData, SessionMeta, save_session
 
 runner = CliRunner()
@@ -53,6 +58,7 @@ class TestCliCommands:
         assert "--continue" in out
         assert "--session" in out
         assert "--verbose" in out
+        assert "--yes" in out
 
     def test_cli_invalid_workspace(self, tmp_path: Path) -> None:
         non_existent = tmp_path / "not_found_dir"
@@ -185,6 +191,91 @@ class TestCliReplExecution:
                 assert "大模型服务商预设列表" in result.stdout
                 assert "deepseek-v4-reasoner" in result.stdout
 
+    def test_repl_provider_failure_visible_and_keeps_model(self, tmp_path: Path) -> None:
+        dummy_llm = DummyLLM("test answer")
+        with patch("mini_agent.cli.OpenAIChatCompletionsClient") as mock_client:
+            mock_client.side_effect = [dummy_llm, RuntimeError("boom")]
+            with patch.dict("os.environ", {"OPENAI_API_KEY": "fake-key"}):
+                result = runner.invoke(
+                    app,
+                    ["--workspace", str(tmp_path)],
+                    input="/provider deepseek\n/model\n/exit\n",
+                )
+                assert result.exit_code == 0
+                assert "失败" in result.stdout
+                assert "boom" in result.stdout
+                assert "已成功切换" not in result.stdout
+                assert "gpt-4o-mini" in result.stdout
+                assert "deepseek-v4" not in result.stdout.split("/model")[-1]
+
+    def test_repl_commit_uses_git_add_u(self, tmp_path: Path) -> None:
+        dummy_llm = DummyLLM("feat: add tests")
+
+        def fake_git(argv: list[str], **kwargs: Any) -> CompletedProcess[str]:
+            if argv[:3] == ["git", "diff", "HEAD"]:
+                return CompletedProcess(argv, 0, stdout="diff --git a/foo.py b/foo.py\n", stderr="")
+            if argv[:3] == ["git", "status", "--porcelain"]:
+                return CompletedProcess(argv, 0, stdout="?? scratch.py\n", stderr="")
+            return CompletedProcess(argv, 0, stdout="", stderr="")
+
+        with patch("mini_agent.cli.OpenAIChatCompletionsClient", return_value=dummy_llm):
+            with patch.dict("os.environ", {"OPENAI_API_KEY": "fake-key"}):
+                with patch("mini_agent.gitutil.subprocess.run", side_effect=fake_git) as mock_run:
+                    with patch.object(
+                        RichAgentEventListener, "on_permission_ask", return_value=Reply.ONCE
+                    ):
+                        result = runner.invoke(
+                            app,
+                            ["--workspace", str(tmp_path)],
+                            input="/commit\n/exit\n",
+                        )
+        assert result.exit_code == 0
+        assert "Git 提交成功" in result.stdout
+        assert "feat: add tests" in result.stdout
+        argv_calls = [call.args[0] for call in mock_run.call_args_list]
+        assert ["git", "add", "-u"] in argv_calls
+        assert ["git", "commit", "-m", "feat: add tests"] in argv_calls
+        assert ["git", "add", "."] not in argv_calls
+        for argv in argv_calls:
+            assert argv[:2] != ["git", "add"] or argv == ["git", "add", "-u"]
+
+    def test_repl_commit_message_gen_passes_empty_tools(self, tmp_path: Path) -> None:
+        class RecordingLLM(DummyLLM):
+            def __init__(self) -> None:
+                super().__init__("feat: recorded")
+                self.tools_seen: list[list[dict[str, object]]] = []
+
+            def create_response(
+                self,
+                history: list[dict[str, object]],
+                tools: list[dict[str, object]],
+                model: str = "gpt-4o-mini",
+                on_token: object = None,
+            ) -> LLMResponse:
+                self.tools_seen.append(tools)
+                return super().create_response(history, tools, model, on_token)
+
+        llm = RecordingLLM()
+        with patch("mini_agent.cli.OpenAIChatCompletionsClient", return_value=llm):
+            with patch.dict("os.environ", {"OPENAI_API_KEY": "fake-key"}):
+                with patch(
+                    "mini_agent.gitutil.subprocess.run",
+                    return_value=CompletedProcess(
+                        ["git"], 0, stdout="diff --git a/foo.py\n", stderr=""
+                    ),
+                ):
+                    with patch.object(
+                        RichAgentEventListener, "on_permission_ask", return_value=Reply.ONCE
+                    ):
+                        result = runner.invoke(
+                            app,
+                            ["--workspace", str(tmp_path)],
+                            input="/commit\n/exit\n",
+                        )
+        assert result.exit_code == 0
+        assert llm.tools_seen
+        assert llm.tools_seen[0] == []
+
     def test_repl_diff_command(self, tmp_path: Path) -> None:
         dummy_llm = DummyLLM("test answer")
         with patch("mini_agent.cli.OpenAIChatCompletionsClient", return_value=dummy_llm):
@@ -243,3 +334,57 @@ class TestCliReplExecution:
         dummy_llm = DummyLLM("你好，这是测试！")
         with patch("rich.prompt.Prompt.ask", side_effect=["你好", "/exit"]):
             run_cli(workspace=tmp_path, llm_client=dummy_llm)
+
+    def test_oneshot_non_tty_ask_exits_2(self, tmp_path: Path, monkeypatch: Any) -> None:
+        class ShellLLM(LLMClient):
+            def create_response(
+                self,
+                history: list[dict[str, object]],
+                tools: list[dict[str, object]],
+                model: str = "gpt-4o-mini",
+                on_token: object = None,
+            ) -> LLMResponse:
+                return LLMResponse(
+                    function_calls=[
+                        FunctionCall(
+                            name="run_shell",
+                            call_id="call_shell",
+                            arguments='{"command": "touch pwned.txt"}',
+                        )
+                    ]
+                )
+
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+        with pytest.raises(typer.Exit) as exc_info:
+            run_cli(workspace=tmp_path, prompt="创建文件", llm_client=ShellLLM())
+        assert exc_info.value.exit_code == 2
+        assert not (tmp_path / "pwned.txt").exists()
+
+    def test_oneshot_yes_allows_ask(self, tmp_path: Path, monkeypatch: Any) -> None:
+        class ShellThenText(LLMClient):
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def create_response(
+                self,
+                history: list[dict[str, object]],
+                tools: list[dict[str, object]],
+                model: str = "gpt-4o-mini",
+                on_token: object = None,
+            ) -> LLMResponse:
+                self.calls += 1
+                if self.calls == 1:
+                    return LLMResponse(
+                        function_calls=[
+                            FunctionCall(
+                                name="run_shell",
+                                call_id="call_shell",
+                                arguments='{"command": "touch allowed.txt"}',
+                            )
+                        ]
+                    )
+                return LLMResponse(text="已创建 allowed.txt")
+
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+        run_cli(workspace=tmp_path, prompt="创建文件", llm_client=ShellThenText(), yes=True)
+        assert (tmp_path / "allowed.txt").exists()

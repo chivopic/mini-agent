@@ -1,7 +1,7 @@
 """Typer CLI interface and Rich REPL implementation (Antigravity Style)."""
 
 import os
-import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any
@@ -11,7 +11,7 @@ from rich import box
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Prompt
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -24,8 +24,15 @@ from mini_agent.cost import (
     load_pricing_table,
     set_custom_pricing,
 )
+from mini_agent.gitutil import git_add_u, git_commit, git_diff, git_diff_head, list_untracked
 from mini_agent.llm import LLMClient, LLMError, OpenAIChatCompletionsClient
-from mini_agent.models import AgentConfig, ToolResult
+from mini_agent.models import AgentConfig, PermissionClass, ToolResult
+from mini_agent.permission import (
+    Decision,
+    DefaultPermissionService,
+    PermissionRequest,
+    Reply,
+)
 from mini_agent.providers import (
     get_provider_preset,
     list_provider_presets,
@@ -36,6 +43,7 @@ from mini_agent.session import (
     get_latest_session,
     list_sessions,
     load_session,
+    save_session,
 )
 
 app = typer.Typer(
@@ -44,6 +52,10 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+
+
+class NonInteractiveAskError(Exception):
+    """ASK in non-interactive mode without --yes; CLI exits with code 2."""
 
 
 def render_banner(
@@ -88,9 +100,16 @@ def render_banner(
 class RichAgentEventListener(AgentEventListener):
     """Rich terminal event listener with structured step cards and token streaming."""
 
-    def __init__(self, console: Console, verbose: bool = False) -> None:
+    def __init__(
+        self,
+        console: Console,
+        verbose: bool = False,
+        *,
+        interactive: bool = True,
+    ) -> None:
         self.console = console
         self.verbose = verbose
+        self.interactive = interactive
         self._streamed_any = False
 
     def on_turn_start(self, user_input: str) -> None:
@@ -155,19 +174,35 @@ class RichAgentEventListener(AgentEventListener):
         else:
             self.console.print(f"  [bold cyan]⚡ Tool: {tool_name}[/bold cyan]")
 
-    def on_tool_confirm(self, command: str) -> bool:
+    def on_permission_ask(self, req: PermissionRequest) -> Reply:
+        if not self.interactive:
+            raise NonInteractiveAskError(req)
+        details = req.reason or f"{req.tool}: {req.resource}"
         self.console.print(
             Panel(
-                f"[yellow]Agent 请求执行以下非只读 Shell 命令：[/yellow]\n\n"
-                f"  [bold cyan]{command}[/bold cyan]\n\n"
-                f"[dim]请确认该命令在当前工作区内执行是否安全。[/dim]",
+                f"[yellow]需要授权才能继续：[/yellow]\n\n"
+                f"{details}\n\n"
+                f"[dim]y=一次 / a=本会话 always / n=拒绝（默认拒绝）[/dim]",
                 title="[bold yellow]⚠️  安全确认 (Security Confirmation)[/bold yellow]",
                 box=box.ROUNDED,
                 border_style="yellow",
                 padding=(0, 2),
             )
         )
-        return Confirm.ask("是否允许执行该命令？", default=False, console=self.console)
+        answer = (
+            Prompt.ask(
+                "允许执行？",
+                default="n",
+                console=self.console,
+            )
+            .strip()
+            .lower()
+        )
+        if answer in ("y", "yes"):
+            return Reply.ONCE
+        if answer in ("a", "always"):
+            return Reply.ALWAYS
+        return Reply.REJECT
 
     def on_tool_finished(self, tool_name: str, result: ToolResult) -> None:
         if result.ok:
@@ -382,6 +417,27 @@ def render_sessions_table(console: Console, workspace: Path) -> None:
     console.print("[dim]输入 /resume <Session ID> 即可继续对应历史会话。[/dim]\n")
 
 
+def _confirm_permission(agent: Agent, req: PermissionRequest) -> bool:
+    """Evaluate GIT/slash permission; one panel via on_permission_ask when ASK."""
+    decision = agent.permission.check(req)
+    if decision == Decision.ALLOW:
+        return True
+    if decision == Decision.DENY:
+        return False
+    reply = Reply.REJECT
+    listener = agent.listener
+    if listener is not None and hasattr(listener, "on_permission_ask"):
+        reply = listener.on_permission_ask(req)
+    if reply == Reply.ALWAYS:
+        agent.permission.remember(req, reply)
+        snapshot = getattr(agent.permission, "snapshot", None)
+        if snapshot is not None:
+            agent.session.permission_memory = snapshot()
+            save_session(agent.session)
+        return True
+    return reply == Reply.ONCE
+
+
 def repl_loop(agent: Agent, console: Console) -> None:
     """Main interactive REPL loop with Antigravity styling."""
     render_banner(
@@ -453,14 +509,16 @@ def repl_loop(agent: Agent, console: Console) -> None:
                 pname = parts[1].strip()
                 preset = get_provider_preset(pname)
                 if preset:
-                    agent.config.model = preset.default_model
-                    agent.session.meta.model = preset.default_model
                     try:
-                        agent.llm_client = OpenAIChatCompletionsClient(
+                        new_client = OpenAIChatCompletionsClient(
                             base_url=preset.base_url,
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        console.print(f"[red]✗ 切换服务商失败，模型未更改: {exc}[/red]\n")
+                        continue
+                    agent.llm_client = new_client
+                    agent.config.model = preset.default_model
+                    agent.session.meta.model = preset.default_model
                     console.print(
                         f"[green]✔ 已成功切换服务商:[/green] "
                         f"[bold cyan]{preset.display_name}[/bold cyan] "
@@ -475,13 +533,7 @@ def repl_loop(agent: Agent, console: Console) -> None:
 
         if user_input == "/diff":
             try:
-                res = subprocess.run(
-                    ["git", "diff"],
-                    cwd=agent.config.workspace_root,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
+                res = git_diff(agent.config.workspace_root)
                 if res.stdout.strip():
                     console.print(
                         Syntax(
@@ -502,13 +554,7 @@ def repl_loop(agent: Agent, console: Console) -> None:
             msg = parts[1].strip() if len(parts) > 1 else ""
             if not msg:
                 try:
-                    diff_res = subprocess.run(
-                        ["git", "diff", "HEAD"],
-                        cwd=agent.config.workspace_root,
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                    )
+                    diff_res = git_diff_head(agent.config.workspace_root)
                     diff_text = diff_res.stdout.strip()
                     if not diff_text:
                         console.print("[yellow]当前没有代码变更可提交。[/yellow]\n")
@@ -516,16 +562,11 @@ def repl_loop(agent: Agent, console: Console) -> None:
                     gen_prompt = (
                         "请根据以下 git diff 生成一行标准规范的 Conventional Commit 信息"
                         "（例如 feat: ... 或 fix: ...），仅直接返回 Commit 文本本身：\n"
-                        f"```diff\n{diff_text[:3000]}\n```"
+                        f"```diff\n{diff_text[:8000]}\n```"
                     )
-                    gen_msg = agent.step(gen_prompt).strip().strip("`'\"")
-                    if Confirm.ask(
-                        f"是否以此信息提交？\n[bold cyan]{gen_msg}[/bold cyan]",
-                        default=True,
-                        console=console,
-                    ):
-                        msg = gen_msg
-                    else:
+                    msg = agent.step(gen_prompt, extra_tools=[]).strip().strip("`'\"")
+                    if not msg:
+                        console.print("[red]✗ 生成提交信息失败: 模型未返回文本[/red]\n")
                         continue
                 except Exception as exc:
                     console.print(f"[red]✗ 生成提交信息失败: {exc}[/red]\n")
@@ -533,12 +574,42 @@ def repl_loop(agent: Agent, console: Console) -> None:
 
             if msg:
                 try:
-                    subprocess.run(["git", "add", "."], cwd=agent.config.workspace_root, check=True)
-                    subprocess.run(
-                        ["git", "commit", "-m", msg], cwd=agent.config.workspace_root, check=True
+                    untracked = list_untracked(agent.config.workspace_root)
+                    untracked_block = (
+                        "\n".join(f"  {path}" for path in untracked) if untracked else "  （无）"
                     )
+                    req = PermissionRequest(
+                        cls=PermissionClass.GIT,
+                        tool="/commit",
+                        resource=msg,
+                        pattern="git:commit",
+                        reason=(
+                            "将执行：\n"
+                            "  git add -u\n"
+                            f"  git commit -m {msg!r}\n"
+                            "未跟踪文件（不会被加入）：\n"
+                            f"{untracked_block}"
+                        ),
+                    )
+                    if not _confirm_permission(agent, req):
+                        console.print("[yellow]已取消 Git 提交。[/yellow]\n")
+                        continue
+                    add_res = git_add_u(agent.config.workspace_root)
+                    if add_res.returncode != 0:
+                        err = (add_res.stderr or add_res.stdout).strip() or add_res.returncode
+                        console.print(f"[red]✗ Git 提交失败: {err}[/red]\n")
+                        continue
+                    commit_res = git_commit(agent.config.workspace_root, msg)
+                    if commit_res.returncode != 0:
+                        err = (commit_res.stderr or commit_res.stdout).strip()
+                        err = err or commit_res.returncode
+                        console.print(f"[red]✗ Git 提交失败: {err}[/red]\n")
+                        continue
                     console.print(f"[green]✔ Git 提交成功:[/green] [bold cyan]{msg}[/bold cyan]\n")
-                except subprocess.CalledProcessError as exc:
+                except NonInteractiveAskError as exc:
+                    console.print("[red]✗ 需要确认才能提交。非交互模式请传递 -y/--yes。[/red]\n")
+                    raise typer.Exit(code=2) from exc
+                except Exception as exc:
                     console.print(f"[red]✗ Git 提交失败: {exc}[/red]\n")
             continue
 
@@ -599,6 +670,11 @@ def repl_loop(agent: Agent, console: Console) -> None:
 
         try:
             agent.step(user_input)
+        except NonInteractiveAskError as exc:
+            console.print(
+                "\n[bold red]需要确认才能执行该操作。非交互模式请传递 -y/--yes。[/bold red]\n"
+            )
+            raise typer.Exit(code=2) from exc
         except LLMError as exc:
             console.print(f"\n[bold red]LLM 错误[/bold red]: {exc}\n")
         except Exception as exc:
@@ -632,6 +708,7 @@ def run_cli(
     continue_session: bool = False,
     session_id: str | None = None,
     verbose: bool = False,
+    yes: bool = False,
     agent_factory: Callable[[AgentConfig, LLMClient, AgentEventListener], Agent] | None = None,
     llm_client: LLMClient | None = None,
 ) -> None:
@@ -681,7 +758,11 @@ def run_cli(
         workspace_root=target_workspace,
         model=resolved_model,
     )
-    listener = RichAgentEventListener(console=console, verbose=verbose)
+    listener = RichAgentEventListener(
+        console=console,
+        verbose=verbose,
+        interactive=sys.stdin.isatty(),
+    )
 
     # Handle session loading
     loaded_session: SessionData | None = None
@@ -706,12 +787,18 @@ def run_cli(
             llm_client=client,
             listener=listener,
             session=loaded_session,
+            permission=DefaultPermissionService(auto_allow_ask=yes),
         )
 
     # One-shot non-interactive execution
     if prompt:
         try:
             agent.step(prompt)
+        except NonInteractiveAskError as exc:
+            console.print(
+                "[bold red]需要确认才能执行该操作。非交互模式请传递 -y/--yes。[/bold red]"
+            )
+            raise typer.Exit(code=2) from exc
         except Exception as exc:
             console.print(f"[bold red]执行失败[/bold red]: {exc}")
             raise typer.Exit(code=1) from exc
@@ -779,6 +866,14 @@ def main(
             help="显示诊断与执行详细信息",
         ),
     ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            "-y",
+            help="将权限询问视为允许（黑名单命令仍会拒绝）",
+        ),
+    ] = False,
 ) -> None:
     """启动 mini-agent 交互式 REPL 或执行单次任务。"""
     run_cli(
@@ -789,4 +884,5 @@ def main(
         continue_session=continue_session,
         session_id=session_id,
         verbose=verbose,
+        yes=yes,
     )

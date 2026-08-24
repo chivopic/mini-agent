@@ -18,7 +18,15 @@ from mini_agent.messages import (
     history_v1_to_messages,
     messages_to_v1_history,
 )
-from mini_agent.models import AgentConfig, RunShellInput, ToolResult
+from mini_agent.models import AgentConfig, PermissionClass, ToolResult
+from mini_agent.permission import (
+    Decision,
+    DefaultPermissionService,
+    PermissionRequest,
+    PermissionService,
+    Reply,
+    pattern_for_shell,
+)
 from mini_agent.prompt import get_system_prompt
 from mini_agent.session import (
     SessionData,
@@ -27,7 +35,8 @@ from mini_agent.session import (
     save_session,
 )
 from mini_agent.tools import ToolRegistry, default_registry
-from mini_agent.tools.protocol import ToolContext
+from mini_agent.tools.filesystem import resolve_relative_path
+from mini_agent.tools.protocol import Tool, ToolContext
 from mini_agent.tools.shell import check_command_safety
 
 
@@ -50,8 +59,8 @@ class AgentEventListener(Protocol):
         """Called before executing a tool."""
         ...
 
-    def on_tool_confirm(self, command: str) -> bool:
-        """Prompt user for confirmation when running non-allowlisted shell commands."""
+    def on_permission_ask(self, req: PermissionRequest) -> Reply:
+        """Prompt once / always / reject when permission.check returns ASK."""
         ...
 
     def on_tool_finished(self, tool_name: str, result: ToolResult) -> None:
@@ -77,6 +86,7 @@ class Agent:
         listener: AgentEventListener | None = None,
         session: SessionData | None = None,
         registry: ToolRegistry | None = None,
+        permission: PermissionService | None = None,
     ) -> None:
         self.config = config
         self.llm_client = llm_client
@@ -84,10 +94,14 @@ class Agent:
         self.registry = registry or default_registry()
         self._cancel = threading.Event()
         self.tools = self.registry.json_schemas()
+        self.permission = permission or DefaultPermissionService()
 
         if session is not None:
             self.session = session
             self.messages: list[Message] = session.messages
+            restore = getattr(self.permission, "restore", None)
+            if restore is not None and session.permission_memory:
+                restore(session.permission_memory)
         else:
             now_iso = datetime.now().isoformat()
             new_meta = SessionMeta(
@@ -132,41 +146,123 @@ class Agent:
         if self.listener and hasattr(self.listener, "on_token"):
             self.listener.on_token(token)
 
+    def _tools_for_turn(self, extra_tools: list[str] | None) -> list[dict[str, Any]]:
+        if extra_tools is None:
+            return self.tools
+        allowed = set(extra_tools)
+        return [
+            schema for schema in self.tools if (schema.get("function") or {}).get("name") in allowed
+        ]
+
+    def _posix_rel(self, user_path: str) -> str:
+        resolved, _error = resolve_relative_path(self.config.workspace_root, user_path)
+        if resolved is None:
+            return user_path.replace("\\", "/")
+        root = self.config.workspace_root.resolve()
+        try:
+            rel = resolved.relative_to(root)
+        except ValueError:
+            return user_path.replace("\\", "/")
+        posix = rel.as_posix()
+        return posix if posix else "."
+
+    def _permission_request(self, tool: Tool, inp: Any) -> PermissionRequest:
+        cls = tool.permission
+        if cls == PermissionClass.SHELL:
+            command = getattr(inp, "command", "")
+            pattern = pattern_for_shell(command) or ""
+            _blocked, _needs_conf, reason = check_command_safety(command)
+            return PermissionRequest(
+                cls=cls,
+                tool=tool.name,
+                resource=command,
+                pattern=pattern,
+                reason=reason or "",
+            )
+        if cls == PermissionClass.EDIT:
+            path = getattr(inp, "path", "")
+            resource = self._posix_rel(path)
+            return PermissionRequest(
+                cls=cls,
+                tool=tool.name,
+                resource=resource,
+                pattern=f"edit:{resource}",
+            )
+        path = getattr(inp, "path", "")
+        return PermissionRequest(
+            cls=cls,
+            tool=tool.name,
+            resource=path,
+            pattern=tool.approval_pattern(inp),
+        )
+
+    def _denied_result(self, name: str, inp: Any, req: PermissionRequest) -> ToolResult:
+        if name == "run_shell":
+            command = getattr(inp, "command", req.resource)
+            is_blocked, _needs_conf, reason = check_command_safety(command)
+            return ToolResult(
+                ok=False,
+                content="",
+                error=reason,
+                metadata={"blocked": is_blocked, "command": command},
+            )
+        return ToolResult(
+            ok=False,
+            content="",
+            error=req.reason or f"操作被拒绝: {name}",
+            metadata={"denied": True},
+        )
+
+    def _rejected_result(self, name: str, inp: Any, req: PermissionRequest) -> ToolResult:
+        if name == "run_shell":
+            command = getattr(inp, "command", req.resource)
+            return ToolResult(
+                ok=False,
+                content="",
+                error=f"用户拒绝执行命令: '{command}'",
+                metadata={"user_cancelled": True, "command": command},
+            )
+        resource = req.resource or name
+        return ToolResult(
+            ok=False,
+            content="",
+            error=f"用户拒绝执行 {name}: '{resource}'",
+            metadata={"user_cancelled": True},
+        )
+
+    def _sync_permission_memory(self) -> None:
+        snapshot = getattr(self.permission, "snapshot", None)
+        if snapshot is not None:
+            self.session.permission_memory = snapshot()
+
     def _execute_tool(self, name: str, raw_arguments: str) -> ToolResult:
-        """Parse arguments and dispatch execution to the corresponding tool."""
+        """Authorize, then parse+dispatch. Invalid JSON skips the permission peek."""
         tool = self.registry.get(name)
         if tool is None:
             return ToolResult(ok=False, content="", error=f"未知的工具名称: '{name}'")
 
-        if name == "run_shell":
+        inp = None
+        try:
+            args = json.loads(raw_arguments) if raw_arguments.strip() else {}
+            if isinstance(args, dict):
+                inp = tool.input_model.model_validate(args)
+        except (json.JSONDecodeError, ValidationError):
             inp = None
-            try:
-                args = json.loads(raw_arguments) if raw_arguments.strip() else {}
-                inp = RunShellInput(**args) if isinstance(args, dict) else None
-            except (json.JSONDecodeError, ValidationError):
-                inp = None
-            if inp is not None:
-                is_blocked, req_conf, reason = check_command_safety(inp.command)
-                if is_blocked:
-                    return ToolResult(
-                        ok=False,
-                        content="",
-                        error=reason,
-                        metadata={"blocked": True, "command": inp.command},
-                    )
-                if req_conf:
-                    allowed = bool(
-                        self.listener
-                        and hasattr(self.listener, "on_tool_confirm")
-                        and self.listener.on_tool_confirm(inp.command)
-                    )
-                    if not allowed:
-                        return ToolResult(
-                            ok=False,
-                            content="",
-                            error=f"用户拒绝执行命令: '{inp.command}'",
-                            metadata={"user_cancelled": True, "command": inp.command},
-                        )
+
+        if inp is not None:
+            req = self._permission_request(tool, inp)
+            decision = self.permission.check(req)
+            if decision == Decision.DENY:
+                return self._denied_result(name, inp, req)
+            if decision == Decision.ASK:
+                reply = Reply.REJECT
+                if self.listener and hasattr(self.listener, "on_permission_ask"):
+                    reply = self.listener.on_permission_ask(req)
+                if reply == Reply.ALWAYS:
+                    self.permission.remember(req, reply)
+                    self._sync_permission_memory()
+                elif reply != Reply.ONCE:
+                    return self._rejected_result(name, inp, req)
 
         ctx = ToolContext(self.config.workspace_root, self.config, self._cancel)
         return self.registry.dispatch(name, raw_arguments, ctx)
@@ -186,14 +282,18 @@ class Agent:
         self.session.meta.total_cost_cny += cost
         self.session_usage = self.session_usage.add(turn_usage)
         self.session.messages = self.messages
+        self._sync_permission_memory()
 
         save_session(self.session)
 
         if self.listener and hasattr(self.listener, "on_usage"):
             self.listener.on_usage(turn_usage, cost, self.config.model)
 
-    def step(self, user_input: str) -> str:
-        """Run a single user turn in the agent loop."""
+    def step(self, user_input: str, extra_tools: list[str] | None = None) -> str:
+        """Run a single user turn in the agent loop.
+
+        extra_tools=None uses the full registry. extra_tools=[] sends no tools.
+        """
         cleaned_input = user_input.strip()
         if not cleaned_input:
             return ""
@@ -203,6 +303,7 @@ class Agent:
 
         self.messages.append(Message(role="user", parts=[TextPart(text=cleaned_input)]))
         turn_usage = UsageStats()
+        turn_tools = self._tools_for_turn(extra_tools)
 
         for _ in range(self.config.max_tool_rounds):
             if self.listener and hasattr(self.listener, "on_model_start"):
@@ -211,7 +312,7 @@ class Agent:
             compacted_history = compact_history(self.history)
             response = self.llm_client.create_response(
                 compacted_history,
-                self.tools,
+                turn_tools,
                 model=self.config.model,
                 on_token=self._on_token,
             )
@@ -271,6 +372,7 @@ class Agent:
 
             self.messages.append(Message(role="assistant", parts=result_parts))
             self.session.messages = self.messages
+            self._sync_permission_memory()
             save_session(self.session)
 
         timeout_msg = "工具调用轮数已达到上限，请缩小任务范围后重试。"

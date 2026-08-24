@@ -39,6 +39,9 @@ BLOCKLIST_PATTERNS = [
     r"\bgit\s+reset\s+--hard\b",
     r"\bgit\s+push\s+.*(-f|--force)\b",
     r"\bgit\s+clean\s+-[a-zA-Z]*f\b",
+    r"\bgit\s+add\s+\.(?:\s|$)",
+    r"\bgit\s+add\s+-[a-zA-Z]*A",
+    r"\bgit\s+add\s+--all\b",
     # Secret / credential leak attempts
     r"\b(printenv|env)\b",
     r"\becho\s+\$(OPENAI|ANTHROPIC|AWS|GITHUB|TOKEN|KEY|SECRET|PASSWORD)",
@@ -119,6 +122,18 @@ def sanitize_environment(base_env: dict[str, str] | None = None) -> dict[str, st
     return clean_env
 
 
+def _is_dangerous_git_add(tokens: list[str]) -> bool:
+    """True when `git add` stages everything via `.` / `-A` / `--all`. Does not match `-u`."""
+    if len(tokens) < 2 or tokens[0] != "git" or tokens[1] != "add":
+        return False
+    for tok in tokens[2:]:
+        if tok in {".", "-A", "--all"}:
+            return True
+        if tok.startswith("-") and not tok.startswith("--") and "A" in tok[1:]:
+            return True
+    return False
+
+
 def check_command_safety(command: str) -> tuple[bool, bool, str | None]:
     """Inspect command safety.
 
@@ -143,6 +158,9 @@ def check_command_safety(command: str) -> tuple[bool, bool, str | None]:
 
     if not tokens:
         return True, False, "命令不能为空"
+
+    if _is_dangerous_git_add(tokens):
+        return True, False, f"命令包含高危模式，已被安全策略直接阻断: '{stripped}'"
 
     # Check against allowlist
     first_token = tokens[0]
