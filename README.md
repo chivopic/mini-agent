@@ -141,6 +141,9 @@ name = "deepseek"
 [limits]
 max_tool_rounds = 32
 shell_timeout_seconds = 30
+context_window_tokens = 128000   # 不按模型自适应；小窗口请调小
+keep_recent_tokens = 24000
+auto_summarize = true
 
 [permission]
 read = "allow"
@@ -339,7 +342,8 @@ mini-agent/
 │       ├── config.py               # TOML + env + CLI 合并
 │       ├── permission.py           # allow / ask / deny
 │       ├── prompt.py               # 系统提示
-│       ├── context.py              # compaction：压缩旧工具输出
+│       ├── compaction.py           # token 感知压缩：prune / 配对修复 / 可选摘要
+│       ├── context.py              # v1 compact_history 兼容 shim
 │       ├── gitutil.py              # git add -u / commit / diff
 │       ├── llm.py                  # Chat Completions 适配器
 │       ├── models.py               # Pydantic 契约
@@ -360,6 +364,7 @@ mini-agent/
     ├── test_agent.py
     ├── test_cli.py
     ├── test_commands.py
+    ├── test_compaction.py
     ├── test_config.py
     ├── test_context.py
     ├── test_cost.py
