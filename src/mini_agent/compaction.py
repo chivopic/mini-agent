@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -215,11 +216,90 @@ def _assert_chat_tool_pairing(messages: list[Message]) -> None:
             cid = row.get("tool_call_id")
             if cid not in open_ids:
                 raise UnpairedToolError("orphan tool row without a matching preceding tool_call")
+            open_ids.remove(cid)
             continue
+        if open_ids:
+            raise UnpairedToolError("tool_calls without matching results")
         if row.get("role") == "assistant" and row.get("tool_calls"):
             open_ids = {tc["id"] for tc in row["tool_calls"]}
         else:
             open_ids = set()
+    if open_ids:
+        raise UnpairedToolError("trailing tool_calls without matching results")
+
+
+def _strip_unpaired_edges(messages: list[Message]) -> list[Message]:
+    """Drop trailing calls without results and leading results without calls."""
+    out = list(messages)
+    changed = True
+    while changed and out:
+        changed = False
+        calls, results = _tool_ids(out)
+        dangling_calls = calls - results
+        dangling_results = results - calls
+        if not dangling_calls and not dangling_results:
+            break
+        last_calls = {p.call_id for p in out[-1].parts if isinstance(p, ToolCallPart)}
+        if last_calls and last_calls <= dangling_calls:
+            out.pop()
+            changed = True
+            continue
+        idx = _system_prefix_len(out)
+        if idx < len(out):
+            first_results = {p.call_id for p in out[idx].parts if isinstance(p, ToolResultPart)}
+            if first_results and first_results <= dangling_results:
+                out.pop(idx)
+                changed = True
+    return out
+
+
+def _flatten_to_user_text(messages: list[Message]) -> list[Message]:
+    lines: list[str] = []
+    for row in to_chat_messages(messages):
+        role = row.get("role")
+        content = str(row.get("content") or "")
+        if role == "system":
+            continue
+        if role == "assistant" and row.get("tool_calls"):
+            if content:
+                lines.append(content)
+            for tc in row["tool_calls"]:
+                fn = tc.get("function") or {}
+                lines.append(f"{fn.get('name', '')}: {fn.get('arguments', '')}")
+            continue
+        if content:
+            lines.append(content)
+    text = "\n".join(lines).strip()
+    if not text:
+        return []
+    return [Message(role="user", parts=[TextPart(text=text)])]
+
+
+def _prepare_summarize_history(pre_keep: list[Message], pruned: list[Message]) -> list[Message]:
+    """Complete or strip the keep cut so the summarizer never sees unpaired tool_calls."""
+    completed = [msg.model_copy(deep=True) for msg in repair_pairing(pre_keep, pruned)]
+    completed = _strip_unpaired_edges(completed)
+    try:
+        _assert_chat_tool_pairing(completed)
+    except UnpairedToolError:
+        completed = _flatten_to_user_text(completed)
+    return completed
+
+
+def _discard_token(_token: str) -> None:
+    return
+
+
+def _last_resort_prune(
+    messages: list[Message],
+    limit: int,
+) -> list[Message]:
+    """Fold keep-zone tool bodies/args when the last turn still exceeds budget."""
+    out = [msg.model_copy(deep=True) for msg in messages]
+    start = _system_prefix_len(out)
+    _prune_zone(out, start, len(out), limit)
+    _dedup_read_file(out, start, len(out))
+    return out
 
 
 def repair_pairing(
@@ -298,18 +378,31 @@ def _try_summarize(
     keep_start: int,
     llm: LLMClient,
     model: str,
+    cancel: threading.Event | None = None,
 ) -> tuple[list[Message], CompactionNotice] | None:
     prefix = window[:system_end]
     pre_keep = window[system_end:keep_start]
     keep = window[keep_start:]
     if not pre_keep:
         return None
+    source = _prepare_summarize_history(pre_keep, window)
+    if not source:
+        return None
     prompt_messages = [
         Message(role="system", parts=[TextPart(text=COMPACTION_SUMMARY_PROMPT)]),
-        *pre_keep,
+        *source,
     ]
+    _assert_chat_tool_pairing(prompt_messages)
+    if cancel is not None and cancel.is_set():
+        return None
     try:
-        response = llm.create_response(prompt_messages, tools=[], model=model)
+        response = llm.create_response(
+            prompt_messages,
+            tools=[],
+            model=model,
+            on_token=_discard_token if cancel is not None else None,
+            cancel=cancel,
+        )
     except Exception:
         return None
     text = (response.text or "").strip() if response is not None else ""
@@ -329,6 +422,7 @@ def compact_for_model(
     tool_schemas: list[dict[str, Any]],
     llm: LLMClient | None,
     model: str,
+    cancel: threading.Event | None = None,
 ) -> tuple[list[Message], CompactionNotice | None]:
     """Build an in-memory window. Does not modify or delete disk messages."""
     budget = _budget(config)
@@ -342,14 +436,15 @@ def compact_for_model(
     keep_start = _keep_start_index(window, config.keep_recent_tokens)
     _prune_zone(window, system_end, keep_start, config.prune_tool_chars)
     _dedup_read_file(window, system_end, keep_start)
+    pruned = window
 
     def finalize(
         msgs: list[Message], notice: CompactionNotice | None
     ) -> tuple[list[Message], CompactionNotice | None]:
-        repaired = repair_pairing(msgs, messages, budget=budget, tool_schemas=tool_schemas)
+        repaired = repair_pairing(msgs, pruned, budget=budget, tool_schemas=tool_schemas)
         if estimate_message_tokens(repaired, tool_schemas) > budget:
             repaired, extra = _hard_trim(repaired, budget, tool_schemas)
-            repaired = repair_pairing(repaired, messages, budget=budget, tool_schemas=tool_schemas)
+            repaired = repair_pairing(repaired, pruned, budget=budget, tool_schemas=tool_schemas)
             if extra and notice is not None:
                 notice = CompactionNotice(
                     summary=notice.summary,
@@ -357,6 +452,8 @@ def compact_for_model(
                 )
             elif extra:
                 notice = CompactionNotice(dropped_count=extra)
+        if estimate_message_tokens(repaired, tool_schemas) > budget:
+            repaired = _last_resort_prune(repaired, config.prune_tool_chars)
         _assert_chat_tool_pairing(repaired)
         return repaired, notice
 
@@ -364,8 +461,9 @@ def compact_for_model(
         return finalize(window, None)
 
     notice: CompactionNotice | None = None
-    if config.auto_summarize and llm is not None:
-        summarized = _try_summarize(window, system_end, keep_start, llm, model)
+    cancelled = cancel is not None and cancel.is_set()
+    if config.auto_summarize and llm is not None and not cancelled:
+        summarized = _try_summarize(window, system_end, keep_start, llm, model, cancel=cancel)
         if summarized is not None:
             window, notice = summarized
             if estimate_message_tokens(window, tool_schemas) <= budget:

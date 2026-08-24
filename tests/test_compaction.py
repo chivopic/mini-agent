@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any, Literal
 
 from mini_agent.agent import Agent
@@ -42,6 +43,7 @@ class RecordingLLM:
         on_token: Any = None,
         cancel: Any = None,
     ) -> LLMResponse:
+        _assert_no_orphan_tools(messages)
         self.calls.append({"messages": list(messages), "tools": list(tools), "model": model})
         if self.exc is not None:
             raise self.exc
@@ -111,11 +113,14 @@ def _assert_no_orphan_tools(window: list[Message]) -> None:
     for row in to_chat_messages(window):
         if row.get("role") == "tool":
             assert row.get("tool_call_id") in open_ids
+            open_ids.remove(row["tool_call_id"])
             continue
+        assert not open_ids
         if row.get("role") == "assistant" and row.get("tool_calls"):
             open_ids = {tc["id"] for tc in row["tool_calls"]}
         else:
             open_ids = set()
+    assert not open_ids
 
 
 def _keep_recent_starting_at(messages: list[Message], idx: int) -> int:
@@ -353,11 +358,13 @@ def test_token_window_never_produces_orphan_tool_when_keep_splits_pair() -> None
     assert estimate_message_tokens(messages) > config.context_window_tokens - config.buffer_tokens
     window, _notice = compact_for_model(messages, config, [], llm, "gpt")
     _assert_no_orphan_tools(window)
+    assert llm.calls
+    _assert_no_orphan_tools(llm.calls[0]["messages"])
     assert huge_args == call.parts[0].arguments
 
 
-def test_over_budget_drops_whole_turn_not_half_pair() -> None:
-    huge_args = json.dumps({"path": "a.py", "content": "Z" * 5000}, ensure_ascii=False)
+def test_summarize_split_pair_restores_pruned_call_not_disk_args() -> None:
+    huge_args = json.dumps({"path": "a.py", "content": "Z" * 4000}, ensure_ascii=False)
     call = _call("c1", "write_file", huge_args)
     result = _result("c1", "write_file", "wrote", metadata={"path": "a.py"})
     recent_u = _text("user", "next")
@@ -374,7 +381,44 @@ def test_over_budget_drops_whole_turn_not_half_pair() -> None:
     result_idx = messages.index(result)
     keep_recent = _keep_recent_starting_at(messages, result_idx)
     llm = RecordingLLM("摘要")
-    # Budget fits recent+summary but not the original huge call.
+    config = CompactionConfig(
+        context_window_tokens=400,
+        buffer_tokens=20,
+        keep_recent_tokens=keep_recent,
+        auto_summarize=True,
+    )
+    window, _notice = compact_for_model(messages, config, [], llm, "gpt")
+    _assert_no_orphan_tools(window)
+    assert llm.calls
+    _assert_no_orphan_tools(llm.calls[0]["messages"])
+
+    call_parts = [p for m in window for p in m.parts if isinstance(p, ToolCallPart)]
+    assert [p.call_id for p in call_parts] == ["c1"]
+    parsed = json.loads(call_parts[0].arguments)
+    assert parsed["path"] == "a.py"
+    assert "已折叠" in parsed["_folded"]
+    assert "Z" * 50 not in call_parts[0].arguments
+    assert call.parts[0].arguments == huge_args
+
+
+def test_over_budget_drops_whole_turn_not_half_pair() -> None:
+    huge_keep = "R" * 4000
+    call = _call("c1", "read_file", "{}")
+    result = _result("c1", "read_file", huge_keep, metadata={"path": "a.py"})
+    recent_u = _text("user", "next")
+    recent_a = _text("assistant", "ok")
+    messages = [
+        _text("system", "sys"),
+        *_fillers(6, 400),
+        _text("user", "read it"),
+        call,
+        result,
+        recent_u,
+        recent_a,
+    ]
+    result_idx = messages.index(result)
+    keep_recent = _keep_recent_starting_at(messages, result_idx)
+    llm = RecordingLLM("摘要")
     config = CompactionConfig(
         context_window_tokens=80,
         buffer_tokens=20,
@@ -383,6 +427,8 @@ def test_over_budget_drops_whole_turn_not_half_pair() -> None:
     )
     window, _notice = compact_for_model(messages, config, [], llm, "gpt")
     _assert_no_orphan_tools(window)
+    assert llm.calls
+    _assert_no_orphan_tools(llm.calls[0]["messages"])
 
     rows = to_chat_messages(window)
     tool_ids = [row["tool_call_id"] for row in rows if row.get("role") == "tool"]
@@ -395,8 +441,7 @@ def test_over_budget_drops_whole_turn_not_half_pair() -> None:
     assert "c1" not in tool_ids
     assert "c1" not in call_ids
     assert any(row.get("content") == "next" for row in rows)
-    assert any(isinstance(p, ToolCallPart) and p.call_id == "c1" for p in call.parts)
-    assert messages[messages.index(result)].parts[0].content == "wrote"
+    assert messages[messages.index(result)].parts[0].content == huge_keep
 
 
 def test_repair_pairing_inserts_missing_call() -> None:
@@ -429,6 +474,43 @@ def test_repair_pairing_over_budget_drops_whole_turn() -> None:
     }
     assert "c1" not in ids
     assert any(isinstance(p, TextPart) and p.text == "next" for m in fixed for p in m.parts)
+
+
+def test_last_resort_prunes_keep_zone_when_last_turn_still_over() -> None:
+    args = json.dumps({"path": "a.py", "content": "Z" * 5000}, ensure_ascii=False)
+    messages = [
+        _text("system", "sys"),
+        _text("user", "write"),
+        _call("c1", "write_file", args),
+        _result("c1", "write_file", "ok", metadata={"path": "a.py"}),
+    ]
+    total = estimate_message_tokens(messages)
+    config = CompactionConfig(
+        context_window_tokens=50,
+        buffer_tokens=10,
+        keep_recent_tokens=total + 10,
+        auto_summarize=False,
+        prune_tool_chars=500,
+    )
+    window, _notice = compact_for_model(messages, config, [], None, "gpt")
+    _assert_no_orphan_tools(window)
+    call_part = next(p for m in window for p in m.parts if isinstance(p, ToolCallPart))
+    parsed = json.loads(call_part.arguments)
+    assert parsed["path"] == "a.py"
+    assert "已折叠" in parsed["_folded"]
+    assert "Z" * 50 not in call_part.arguments
+    assert messages[2].parts[0].arguments == args
+
+
+def test_cancel_skips_summarize() -> None:
+    llm = RecordingLLM()
+    messages = [_text("system", "sys"), *_fillers(8, 500), _text("user", "recent")]
+    config = _over_config(messages, auto_summarize=True)
+    cancel = threading.Event()
+    cancel.set()
+    window, _notice = compact_for_model(messages, config, [], llm, "gpt", cancel=cancel)
+    assert llm.calls == []
+    _assert_no_orphan_tools(window)
 
 
 def test_hard_trim_drops_oldest_user_turns() -> None:

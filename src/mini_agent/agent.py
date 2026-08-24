@@ -367,6 +367,7 @@ class Agent:
             tool_schemas,
             self.llm_client,
             self.config.model,
+            cancel=self._cancel,
         )
         if notice is not None:
             self.listener.on_event(notice)
