@@ -62,6 +62,7 @@ class TestCliCommands:
         assert "--session" in out
         assert "--verbose" in out
         assert "--yes" in out
+        assert "--config" in out
 
     def test_cli_invalid_workspace(self, tmp_path: Path) -> None:
         non_existent = tmp_path / "not_found_dir"

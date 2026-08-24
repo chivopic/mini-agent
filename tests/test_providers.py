@@ -1,6 +1,9 @@
 """Unit tests for provider presets."""
 
+import pytest
+
 from mini_agent.providers import (
+    expand_provider_preset,
     get_provider_preset,
     list_provider_presets,
 )
@@ -35,3 +38,23 @@ def test_get_provider_preset_deepseek_v4() -> None:
 def test_get_unknown_provider_preset() -> None:
     unknown = get_provider_preset("non_existent_provider")
     assert unknown is None
+
+
+def test_expand_provider_preset_explicit_base_url_overrides() -> None:
+    model, base_url = expand_provider_preset(
+        "deepseek",
+        base_url="https://example.com/v1",
+    )
+    assert model == "deepseek-v4"
+    assert base_url == "https://example.com/v1"
+
+
+def test_expand_provider_preset_explicit_model_overrides() -> None:
+    model, base_url = expand_provider_preset("openai", model="gpt-4o")
+    assert model == "gpt-4o"
+    assert base_url == "https://api.openai.com/v1"
+
+
+def test_expand_unknown_provider_preset_raises() -> None:
+    with pytest.raises(ValueError, match="未知服务商预设"):
+        expand_provider_preset("not-a-real-preset")

@@ -17,6 +17,7 @@ from rich.table import Table
 from rich.text import Text
 
 from mini_agent.agent import Agent, AgentEventListener
+from mini_agent.config import ConfigError, load_app_config
 from mini_agent.cost import (
     UsageStats,
     format_cost_cny,
@@ -726,25 +727,6 @@ def repl_loop(agent: Agent, console: Console) -> None:
             console.print(f"\n[bold red]执行错误[/bold red]: {exc}\n")
 
 
-def load_dotenv(workspace_root: Path | None = None) -> None:
-    """Lightweight loader for .env file within workspace."""
-    path = (workspace_root / ".env") if workspace_root else Path(".env")
-    if path.is_file():
-        try:
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    stripped = line.strip()
-                    if not stripped or stripped.startswith("#") or "=" not in stripped:
-                        continue
-                    key, val = stripped.split("=", 1)
-                    key = key.strip()
-                    val = val.strip().strip("'\"")
-                    if key and key not in os.environ:
-                        os.environ[key] = val
-        except OSError:
-            pass
-
-
 def run_cli(
     workspace: Path | None = None,
     model: str | None = None,
@@ -754,12 +736,12 @@ def run_cli(
     session_id: str | None = None,
     verbose: bool = False,
     yes: bool = False,
+    config_path: Path | None = None,
     agent_factory: Callable[[AgentConfig, LLMClient, AgentEventListener], Agent] | None = None,
     llm_client: LLMClient | None = None,
 ) -> None:
     """Core logic to run the CLI in interactive or one-shot mode."""
     target_workspace = (workspace or Path.cwd()).resolve()
-    load_dotenv(target_workspace)
     if not target_workspace.exists():
         console.print(f"[bold red]错误[/bold red]: 指定的工作区路径不存在: '{target_workspace}'")
         raise typer.Exit(code=1)
@@ -767,19 +749,24 @@ def run_cli(
         console.print(f"[bold red]错误[/bold red]: 指定的工作区路径不是目录: '{target_workspace}'")
         raise typer.Exit(code=1)
 
-    effective_base_url = (
-        base_url or os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
-    )
-    if model:
-        resolved_model = model
-    elif os.environ.get("MINI_AGENT_MODEL"):
-        resolved_model = os.environ["MINI_AGENT_MODEL"]
-    elif effective_base_url and "deepseek" in effective_base_url.lower():
-        resolved_model = "deepseek-v4"
-    else:
-        resolved_model = "gpt-4o-mini"
+    try:
+        app_config, config_warnings = load_app_config(
+            target_workspace,
+            cli_model=model,
+            cli_base_url=base_url,
+            user_config_path=config_path,
+            user_config_required=config_path is not None,
+        )
+    except ConfigError as exc:
+        console.print(f"[bold red]错误[/bold red]: {exc}")
+        raise typer.Exit(code=1) from exc
 
-    # Verify API key if default client is used
+    for warning in config_warnings:
+        console.print(f"[yellow]{warning}[/yellow]")
+
+    effective_base_url = app_config.provider.base_url
+
+    # Verify API key if default client is used. TOML api_key keys are ignored.
     if llm_client is None:
         api_key = os.environ.get("OPENAI_API_KEY", "").strip()
         if not api_key:
@@ -799,10 +786,7 @@ def run_cli(
     else:
         client = llm_client
 
-    config = AgentConfig(
-        workspace_root=target_workspace,
-        model=resolved_model,
-    )
+    config = app_config.to_agent_config(target_workspace)
     listener = RichAgentEventListener(
         console=console,
         verbose=verbose,
@@ -832,7 +816,10 @@ def run_cli(
             llm_client=client,
             listener=listener,
             session=loaded_session,
-            permission=DefaultPermissionService(auto_allow_ask=yes),
+            permission=DefaultPermissionService(
+                class_defaults=app_config.permission_class_defaults(),
+                auto_allow_ask=yes,
+            ),
         )
 
     # One-shot non-interactive execution
@@ -919,6 +906,13 @@ def main(
             help="将权限询问视为允许（黑名单命令仍会拒绝）",
         ),
     ] = False,
+    config_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--config",
+            help="用户配置文件路径（默认 ~/.mini-agent/config.toml）",
+        ),
+    ] = None,
 ) -> None:
     """启动 mini-agent 交互式 REPL 或执行单次任务。"""
     run_cli(
@@ -930,4 +924,5 @@ def main(
         session_id=session_id,
         verbose=verbose,
         yes=yes,
+        config_path=config_path,
     )
