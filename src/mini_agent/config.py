@@ -128,6 +128,8 @@ def load_app_config(
     Merge order (high wins): CLI flags > process env (after dotenv) >
     project ``<workspace>/.mini-agent.toml`` > user TOML > code defaults.
     ``name`` expands a provider preset; explicit ``base_url`` / ``model`` win.
+    A layer that sets ``name`` drops inherited ``model`` / ``base_url`` unless
+    that same layer (or a still-higher one) set them.
     """
     warnings: list[str] = []
     if apply_dotenv:
@@ -249,10 +251,24 @@ def _strip_secret_keys(value: object, warnings: list[str], *, source: str) -> ob
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     merged = dict(base)
     for key, value in override.items():
-        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
-            merged[key] = _deep_merge(merged[key], value)
+        existing = merged.get(key)
+        if key == "provider" and isinstance(value, dict):
+            # Setting name is a preset switch, not a field-wise overlay.
+            merged[key] = _merge_provider(existing if isinstance(existing, dict) else {}, value)
+        elif isinstance(existing, dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(existing, value)
         else:
             merged[key] = value
+    return merged
+
+
+def _merge_provider(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    if "name" in overlay:
+        merged.pop("model", None)
+        merged.pop("base_url", None)
+    for key, value in overlay.items():
+        merged[key] = value
     return merged
 
 

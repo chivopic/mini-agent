@@ -112,6 +112,41 @@ def test_explicit_model_overrides_preset_default(tmp_path: Path) -> None:
     assert cfg.provider.base_url == "https://api.deepseek.com"
 
 
+def test_project_name_drops_inherited_model_and_base_url(
+    tmp_path: Path, isolate_app_config: Path
+) -> None:
+    _write(
+        isolate_app_config,
+        '[provider]\nname = "openai"\nmodel = "gpt-4o"\nbase_url = "https://api.openai.com/v1"\n',
+    )
+    _write(tmp_path / ".mini-agent.toml", '[provider]\nname = "deepseek"\n')
+    cfg, _warnings = load_app_config(tmp_path)
+    assert cfg.provider.name == "deepseek"
+    assert cfg.provider.model == "deepseek-v4"
+    assert cfg.provider.base_url == "https://api.deepseek.com"
+
+
+def test_project_name_keeps_same_or_higher_explicit_model(
+    tmp_path: Path, isolate_app_config: Path, monkeypatch: object
+) -> None:
+    _write(
+        isolate_app_config,
+        '[provider]\nname = "openai"\nmodel = "gpt-4o"\nbase_url = "https://api.openai.com/v1"\n',
+    )
+    _write(
+        tmp_path / ".mini-agent.toml",
+        '[provider]\nname = "deepseek"\nmodel = "from-project"\n',
+    )
+    cfg, _warnings = load_app_config(tmp_path)
+    assert cfg.provider.model == "from-project"
+    assert cfg.provider.base_url == "https://api.deepseek.com"
+
+    monkeypatch.setenv("MINI_AGENT_MODEL", "from-env")  # type: ignore[attr-defined]
+    cfg, _warnings = load_app_config(tmp_path)
+    assert cfg.provider.model == "from-env"
+    assert cfg.provider.base_url == "https://api.deepseek.com"
+
+
 def test_missing_openai_api_key_still_non_zero_for_default_client(tmp_path: Path) -> None:
     _write(
         tmp_path / ".mini-agent.toml",
