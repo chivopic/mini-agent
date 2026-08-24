@@ -1,6 +1,7 @@
 """Controlled shell execution tool with safety checks and environment sanitization."""
 
 import os
+import posixpath
 import re
 import shlex
 import signal
@@ -122,15 +123,71 @@ def sanitize_environment(base_env: dict[str, str] | None = None) -> dict[str, st
     return clean_env
 
 
+# git(1) global options that consume the following argv token when given without '='.
+_GIT_GLOBAL_OPTS_WITH_VALUE = frozenset(
+    {
+        "-C",
+        "-c",
+        "--exec-path",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--super-prefix",
+        "--config-env",
+        "--attr-source",
+    }
+)
+
+
+def _git_subcommand_index(tokens: list[str]) -> int:
+    """Index of the git subcommand, skipping global options. len(tokens) if none."""
+    i = 1
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "--":
+            return i + 1
+        if not tok.startswith("-"):
+            return i
+        name, eq, _val = tok.partition("=")
+        if eq:
+            i += 1
+            continue
+        if name in _GIT_GLOBAL_OPTS_WITH_VALUE:
+            i += 2
+            continue
+        i += 1
+    return i
+
+
+def _pathspec_is_dot(pathspec: str) -> bool:
+    """True when a git pathspec names the current directory (`.`, `./`, `./.`, …)."""
+    posix = pathspec.replace("\\", "/")
+    return posixpath.normpath(posix) == "."
+
+
 def _is_dangerous_git_add(tokens: list[str]) -> bool:
     """True when `git add` stages everything via `.` / `-A` / `--all`. Does not match `-u`."""
-    if len(tokens) < 2 or tokens[0] != "git" or tokens[1] != "add":
+    if not tokens or tokens[0] != "git":
         return False
-    for tok in tokens[2:]:
-        if tok in {".", "-A", "--all"}:
+    sub_i = _git_subcommand_index(tokens)
+    if sub_i >= len(tokens) or tokens[sub_i] != "add":
+        return False
+    rest = tokens[sub_i + 1 :]
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--":
+            return any(_pathspec_is_dot(p) for p in rest[i + 1 :])
+        if tok.startswith("-") and tok != "-":
+            if tok in {"-A", "--all", "--no-ignore-removal"}:
+                return True
+            if not tok.startswith("--") and "A" in tok[1:]:
+                return True
+            i += 1
+            continue
+        if _pathspec_is_dot(tok):
             return True
-        if tok.startswith("-") and not tok.startswith("--") and "A" in tok[1:]:
-            return True
+        i += 1
     return False
 
 
@@ -175,6 +232,8 @@ def check_command_safety(command: str) -> tuple[bool, bool, str | None]:
         # Even if command base is allowlisted, check for suspicious redirection/pipe
         if any(tok in ("|", ">", ">>", "&", "&&", ";") for tok in tokens):
             return False, True, "命令包含管道或重定向，需要用户确认"
+        if "-c" in tokens:
+            return False, True, "命令包含 -c 内联代码，需要用户确认"
         return False, False, None
 
     # Default for all non-allowlisted commands: require confirmation

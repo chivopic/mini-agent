@@ -11,8 +11,6 @@ from pydantic import BaseModel, Field, field_validator
 from mini_agent.models import PermissionClass
 from mini_agent.tools.shell import check_command_safety
 
-_NEVER_ALWAYS_INTERPRETERS = frozenset({"python", "python3", "bash", "sh", "zsh"})
-
 
 class Decision(StrEnum):
     ALLOW = "allow"
@@ -84,9 +82,7 @@ def pattern_for_shell(command: str) -> str | None:
     if not tokens:
         return None
 
-    if len(tokens) >= 2 and tokens[1] == "-c":
-        return None
-    if tokens[0] in _NEVER_ALWAYS_INTERPRETERS and "-c" in tokens[1:3]:
+    if "-c" in tokens:
         return None
 
     if len(tokens) >= 2 and tokens[0] == "git" and tokens[1] == "add":
@@ -126,13 +122,16 @@ class DefaultPermissionService:
             self.restore(memory)
 
     def restore(self, snapshot: list[Any]) -> None:
+        """Replace (do not merge) in-memory always grants from a snapshot."""
         if not isinstance(snapshot, list):
             raise TypeError("permission_memory must be a list")
+        parsed: dict[tuple[PermissionClass, str], Decision] = {}
         for i, raw in enumerate(snapshot):
             if not isinstance(raw, dict):
                 raise ValueError(f"permission_memory[{i}] must be an object")
             entry = PermissionMemoryEntry.model_validate(raw)
-            self._memory[(entry.cls, entry.pattern)] = entry.effect
+            parsed[(entry.cls, entry.pattern)] = entry.effect
+        self._memory = parsed
 
     def check(self, req: PermissionRequest) -> Decision:
         shell_needs_confirm = True

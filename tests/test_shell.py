@@ -62,6 +62,12 @@ class TestCommandSafetyPolicy:
     def test_git_add_dot_and_all_blocked(self) -> None:
         blocked_cmds = [
             "git add .",
+            "git add ./",
+            "git add ./.",
+            'git add "./"',
+            "git -C . add .",
+            "git -C /tmp add ./",
+            "git --git-dir=/tmp/repo add .",
             "git add -A",
             "git add --all",
             "git add -uA",
@@ -75,6 +81,15 @@ class TestCommandSafetyPolicy:
 
     def test_git_add_u_not_blocked(self) -> None:
         is_blocked, req_conf, reason = check_command_safety("git add -u")
+        assert is_blocked is False
+        assert req_conf is True
+        assert reason is not None
+
+    def test_uv_run_python_script_allowlisted_but_dash_c_is_not(self) -> None:
+        is_blocked, req_conf, reason = check_command_safety("uv run python script.py")
+        assert is_blocked is False
+        assert req_conf is False
+        is_blocked, req_conf, reason = check_command_safety("uv run python -c 'print(1)'")
         assert is_blocked is False
         assert req_conf is True
         assert reason is not None

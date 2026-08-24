@@ -459,3 +459,27 @@ class TestAgentLoop:
         answer = agent.step("生成提交说明", extra_tools=[])
         assert answer == "feat: x"
         assert llm.tools_args == [[]]
+
+    def test_extra_tools_empty_does_not_dispatch_function_calls(self, tmp_path: Path) -> None:
+        fake_llm = FakeLLMClient(
+            [
+                LLMResponse(
+                    function_calls=[
+                        FunctionCall(
+                            name="write_file",
+                            call_id="call_hallucinated",
+                            arguments='{"path": "pwned.py", "content": "x"}',
+                        )
+                    ]
+                ),
+                LLMResponse(text="feat: no tools"),
+            ]
+        )
+        agent = Agent(config=AgentConfig(workspace_root=tmp_path), llm_client=fake_llm)
+        answer = agent.step("生成提交说明", extra_tools=[])
+        assert answer == "feat: no tools"
+        assert not (tmp_path / "pwned.py").exists()
+        outputs = [item for item in agent.history if item.get("type") == "function_call_output"]
+        assert len(outputs) == 1
+        assert outputs[0]["call_id"] == "call_hallucinated"
+        assert "未启用工具" in outputs[0]["output"]

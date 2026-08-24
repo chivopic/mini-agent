@@ -100,8 +100,8 @@ class Agent:
             self.session = session
             self.messages: list[Message] = session.messages
             restore = getattr(self.permission, "restore", None)
-            if restore is not None and session.permission_memory:
-                restore(session.permission_memory)
+            if restore is not None:
+                restore(session.permission_memory or [])
         else:
             now_iso = datetime.now().isoformat()
             new_meta = SessionMeta(
@@ -345,6 +345,7 @@ class Agent:
             self.messages.append(Message(role="assistant", parts=call_parts))
 
             result_parts: list[ToolResultPart] = []
+            tools_disabled = extra_tools == []
             for call in response.function_calls:
                 try:
                     args_dict = json.loads(call.arguments) if call.arguments.strip() else {}
@@ -354,7 +355,15 @@ class Agent:
                 if self.listener and hasattr(self.listener, "on_tool_start"):
                     self.listener.on_tool_start(call.name, args_dict)
 
-                result = self._execute_tool(call.name, call.arguments)
+                if tools_disabled:
+                    result = ToolResult(
+                        ok=False,
+                        content="",
+                        error=f"本轮未启用工具，拒绝执行: '{call.name}'",
+                        metadata={"tools_disabled": True, "name": call.name},
+                    )
+                else:
+                    result = self._execute_tool(call.name, call.arguments)
 
                 if self.listener and hasattr(self.listener, "on_tool_finished"):
                     self.listener.on_tool_finished(call.name, result)

@@ -93,6 +93,11 @@ class TestPatternForShell:
         assert pattern_for_shell("bash -c 'echo hi'") is None
         assert pattern_for_shell("sh -c echo") is None
         assert pattern_for_shell("zsh -c echo") is None
+        assert pattern_for_shell("uv run python -c 'print(1)'") is None
+
+    def test_uv_run_python_script_prefix_does_not_cover_dash_c(self) -> None:
+        assert pattern_for_shell("uv run python script.py") == "uv run python*"
+        assert pattern_for_shell("uv run python -c 'print(1)'") is None
 
     def test_npx_prefix(self) -> None:
         assert pattern_for_shell("npx eslint .") == "npx eslint*"
@@ -124,15 +129,16 @@ class TestDefaultPermissionService:
 
     def test_git_add_dot_deny_cannot_always(self) -> None:
         svc = DefaultPermissionService()
-        req = _req(
-            cls=PermissionClass.SHELL,
-            tool="run_shell",
-            resource="git add .",
-            pattern="git add .",
-        )
-        assert svc.check(req) == Decision.DENY
-        svc.remember(req, Reply.ALWAYS)
-        assert svc.check(req) == Decision.DENY
+        for command in ("git add .", "git add ./", "git add ./.", 'git add "./"', "git -C . add ."):
+            req = _req(
+                cls=PermissionClass.SHELL,
+                tool="run_shell",
+                resource=command,
+                pattern=command,
+            )
+            assert svc.check(req) == Decision.DENY, command
+            svc.remember(req, Reply.ALWAYS)
+            assert svc.check(req) == Decision.DENY, command
 
     def test_git_add_all_deny(self) -> None:
         svc = DefaultPermissionService()
@@ -158,6 +164,28 @@ class TestDefaultPermissionService:
         assert svc.check(req) == Decision.ASK
         svc.remember(req, Reply.ALWAYS)
         assert svc.check(req) == Decision.ASK
+
+    def test_uv_run_python_dash_c_not_auto_allow_and_not_covered_by_always(self) -> None:
+        svc = DefaultPermissionService()
+        script = _req(
+            cls=PermissionClass.SHELL,
+            tool="run_shell",
+            resource="uv run python script.py",
+            pattern=pattern_for_shell("uv run python script.py") or "",
+        )
+        assert script.pattern == "uv run python*"
+        assert svc.check(script) == Decision.ALLOW
+        svc.remember(script, Reply.ALWAYS)
+        dash_c = _req(
+            cls=PermissionClass.SHELL,
+            tool="run_shell",
+            resource="uv run python -c 'print(1)'",
+            pattern=pattern_for_shell("uv run python -c 'print(1)'") or "",
+        )
+        assert dash_c.pattern == ""
+        assert svc.check(dash_c) == Decision.ASK
+        svc.remember(dash_c, Reply.ALWAYS)
+        assert svc.check(dash_c) == Decision.ASK
 
     def test_always_then_same_pattern_not_asked(self) -> None:
         svc = DefaultPermissionService()
@@ -276,6 +304,43 @@ class TestDefaultPermissionService:
             svc.restore([{"cls": "shell"}])
         with pytest.raises((ValueError, Exception)):
             svc.restore([{"cls": "shell", "pattern": "pwd", "effect": "ask"}])
+
+    def test_restore_replaces_rather_than_merges(self) -> None:
+        svc = DefaultPermissionService()
+        old = _req(
+            cls=PermissionClass.SHELL,
+            tool="run_shell",
+            resource="git add -u",
+            pattern="git add -u",
+        )
+        svc.remember(old, Reply.ALWAYS)
+        assert svc.check(old) == Decision.ALLOW
+        svc.restore([{"cls": "shell", "pattern": "uv run pytest*", "effect": "allow"}])
+        assert svc.check(old) == Decision.ASK
+        pytest_req = _req(
+            cls=PermissionClass.SHELL,
+            tool="run_shell",
+            resource="uv run pytest tests/test_agent.py -q",
+            pattern="uv run pytest*",
+        )
+        assert svc.check(pytest_req) == Decision.ALLOW
+        svc.restore([])
+        assert svc.snapshot() == []
+        assert svc.check(pytest_req) == Decision.ALLOW  # allowlisted
+        assert svc.check(old) == Decision.ASK
+
+    def test_restore_malformed_keeps_existing_memory(self) -> None:
+        svc = DefaultPermissionService()
+        old = _req(
+            cls=PermissionClass.SHELL,
+            tool="run_shell",
+            resource="git add -u",
+            pattern="git add -u",
+        )
+        svc.remember(old, Reply.ALWAYS)
+        with pytest.raises((ValueError, Exception)):
+            svc.restore([{"cls": "shell"}])
+        assert svc.check(old) == Decision.ALLOW
 
 
 class TestAgentPermissionIntegration:

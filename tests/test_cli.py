@@ -12,6 +12,7 @@ import typer
 from rich.console import Console
 from typer.testing import CliRunner
 
+from mini_agent.agent import Agent
 from mini_agent.cli import (
     RichAgentEventListener,
     app,
@@ -21,8 +22,8 @@ from mini_agent.cli import (
     run_cli,
 )
 from mini_agent.llm import FunctionCall, LLMClient, LLMResponse
-from mini_agent.models import ToolResult
-from mini_agent.permission import Reply
+from mini_agent.models import AgentConfig, ToolResult
+from mini_agent.permission import DefaultPermissionService, Reply
 from mini_agent.session import SessionData, SessionMeta, save_session
 
 runner = CliRunner()
@@ -164,6 +165,60 @@ class TestCliReplExecution:
                 )
                 assert result.exit_code == 0
                 assert "deepseek-reasoner" in result.stdout
+
+    def test_repl_resume_replaces_permission_memory(self, tmp_path: Path, monkeypatch: Any) -> None:
+        sessions_dir = tmp_path / "sessions"
+        monkeypatch.setenv("MINI_AGENT_SESSIONS_DIR", str(sessions_dir))
+        now = datetime.now().isoformat()
+        ws = tmp_path.resolve().as_posix()
+        s_old = SessionData(
+            meta=SessionMeta(
+                session_id="s_old",
+                workspace_root=ws,
+                created_at=now,
+                updated_at=now,
+                model="gpt-4o-mini",
+                title="旧会话",
+                turn_count=1,
+            ),
+            permission_memory=[{"cls": "shell", "pattern": "git add -u", "effect": "allow"}],
+        )
+        s_new = SessionData(
+            meta=SessionMeta(
+                session_id="s_new",
+                workspace_root=ws,
+                created_at=now,
+                updated_at=now,
+                model="gpt-4o-mini",
+                title="新会话",
+                turn_count=1,
+            ),
+            permission_memory=[{"cls": "shell", "pattern": "uv run pytest*", "effect": "allow"}],
+        )
+        save_session(s_old, sessions_dir=sessions_dir)
+        save_session(s_new, sessions_dir=sessions_dir)
+
+        captured: dict[str, Agent] = {}
+
+        def factory(config: AgentConfig, client: LLMClient, listener: object) -> Agent:
+            agent = Agent(
+                config=config,
+                llm_client=client,
+                listener=listener,  # type: ignore[arg-type]
+                session=s_old,
+                permission=DefaultPermissionService(),
+            )
+            captured["agent"] = agent
+            return agent
+
+        dummy_llm = DummyLLM("ok")
+        with patch("rich.prompt.Prompt.ask", side_effect=["/resume s_new", "/exit"]):
+            run_cli(workspace=tmp_path, llm_client=dummy_llm, agent_factory=factory)
+
+        agent = captured["agent"]
+        assert agent.session.meta.session_id == "s_new"
+        patterns = {entry["pattern"] for entry in agent.permission.snapshot()}
+        assert patterns == {"uv run pytest*"}
 
     def test_repl_sessions_and_new_commands(self, tmp_path: Path) -> None:
         dummy_llm = DummyLLM("test answer")

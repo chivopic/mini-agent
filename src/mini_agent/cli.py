@@ -623,6 +623,9 @@ def repl_loop(agent: Agent, console: Console) -> None:
                 target_id = parts[1].strip()
                 loaded = load_session(target_id)
                 if loaded:
+                    restore = getattr(agent.permission, "restore", None)
+                    if restore is not None:
+                        restore(loaded.permission_memory or [])
                     agent.session = loaded
                     agent.history = loaded.history
                     console.print(
