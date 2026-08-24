@@ -7,7 +7,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
+
+from mini_agent.messages import (
+    Message,
+    UnpairedToolError,
+    assert_pairing,
+    history_v1_to_messages,
+    messages_to_v1_history,
+)
 
 
 class SessionMeta(BaseModel):
@@ -28,8 +36,14 @@ class SessionMeta(BaseModel):
 class SessionData(BaseModel):
     """Complete session data including conversation history."""
 
+    schema_version: int = 2
     meta: SessionMeta
-    history: list[dict[str, Any]] = Field(default_factory=list)
+    messages: list[Message] = Field(default_factory=list)
+    permission_memory: list[Any] = Field(default_factory=list)
+
+    @property
+    def history(self) -> list[dict[str, Any]]:
+        return messages_to_v1_history(self.messages)
 
 
 def get_default_sessions_dir() -> Path:
@@ -37,8 +51,13 @@ def get_default_sessions_dir() -> Path:
     custom_dir = os.environ.get("MINI_AGENT_SESSIONS_DIR")
     if custom_dir:
         path = Path(custom_dir).resolve()
-    else:
-        path = Path.home() / ".mini-agent" / "sessions"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    home_dir = Path.home() / ".mini-agent"
+    home_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(home_dir, 0o700)
+    path = home_dir / "sessions"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -69,17 +88,28 @@ def save_session(session: SessionData, sessions_dir: Path | None = None) -> Path
 
 
 def load_session(session_id: str, sessions_dir: Path | None = None) -> SessionData | None:
-    """Load a session by its ID."""
-    target_dir = sessions_dir or get_default_sessions_dir()
-    file_path = target_dir / f"{session_id}.json"
-    if not file_path.is_file():
+    """Load a session by its ID, migrating v1 history files to schema v2 in memory."""
+    path = (sessions_dir or get_default_sessions_dir()) / f"{session_id}.json"
+    if not path.is_file():
         return None
-
     try:
-        with open(file_path, encoding="utf-8") as f:
-            data = json.load(f)
-        return SessionData.model_validate(data)
-    except (json.JSONDecodeError, ValueError, OSError):
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    version = data.get("schema_version", 1)
+    try:
+        if version == 1:
+            meta = SessionMeta.model_validate(data["meta"])
+            messages = history_v1_to_messages(data.get("history") or [], created_at=meta.created_at)
+            return SessionData(schema_version=2, meta=meta, messages=messages, permission_memory=[])
+        if version == 2:
+            sess = SessionData.model_validate(data)
+            assert_pairing(sess.messages)
+            return sess
+        return None
+    except (UnpairedToolError, ValidationError, KeyError, AssertionError):
         return None
 
 

@@ -1,0 +1,30 @@
+[
+  {"role": "system", "content": "You are assistant."},
+  {"role": "user", "content": "读 a.txt 和 b.txt"},
+  {
+    "role": "assistant",
+    "tool_calls": [
+      {
+        "id": "call_read_a",
+        "type": "function",
+        "function": {"name": "read_file", "arguments": "{\"path\": \"a.txt\"}"}
+      },
+      {
+        "id": "call_read_b",
+        "type": "function",
+        "function": {"name": "read_file", "arguments": "{\"path\": \"b.txt\"}"}
+      }
+    ]
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "call_read_a",
+    "output": "{\"ok\":true,\"content\":\"AAA\",\"error\":null,\"metadata\":{\"path\":\"a.txt\"}}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "call_read_b",
+    "output": "{\"ok\":true,\"content\":\"BBB\",\"error\":null,\"metadata\":{\"path\":\"b.txt\"}}"
+  },
+  {"role": "assistant", "content": "文件 a 的内容是 AAA，文件 b 的内容是 BBB。"}
+]

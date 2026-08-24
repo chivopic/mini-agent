@@ -1,5 +1,6 @@
 """Unit tests for Typer CLI and REPL interface."""
 
+import re
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -44,12 +45,14 @@ class TestCliCommands:
     def test_cli_help_flag(self) -> None:
         result = runner.invoke(app, ["--help"])
         assert result.exit_code == 0
-        assert "--workspace" in result.stdout
-        assert "--model" in result.stdout
-        assert "--base-url" in result.stdout
-        assert "--continue" in result.stdout
-        assert "--session" in result.stdout
-        assert "--verbose" in result.stdout
+        # Rich may wrap `--` with ANSI when FORCE_COLOR is set.
+        out = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+        assert "--workspace" in out
+        assert "--model" in out
+        assert "--base-url" in out
+        assert "--continue" in out
+        assert "--session" in out
+        assert "--verbose" in out
 
     def test_cli_invalid_workspace(self, tmp_path: Path) -> None:
         non_existent = tmp_path / "not_found_dir"

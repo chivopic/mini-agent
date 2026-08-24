@@ -1,13 +1,16 @@
 """Unit tests for session persistence and resume manager."""
 
+import json
 from datetime import datetime
 from pathlib import Path
 
+from mini_agent.messages import TextPart, history_v1_to_messages
 from mini_agent.session import (
     SessionData,
     SessionMeta,
     delete_session,
     generate_session_id,
+    get_default_sessions_dir,
     get_latest_session,
     list_sessions,
     load_session,
@@ -38,17 +41,29 @@ def test_save_and_load_session(tmp_path: Path) -> None:
         {"role": "user", "content": "hello"},
         {"role": "assistant", "content": "world"},
     ]
-    session = SessionData(meta=meta, history=history)
+    session = SessionData(
+        meta=meta,
+        messages=history_v1_to_messages(history, created_at=meta.created_at),
+    )
 
     saved_path = save_session(session, sessions_dir=tmp_path)
     assert saved_path.exists()
 
     loaded = load_session(sid, sessions_dir=tmp_path)
     assert loaded is not None
+    assert loaded.schema_version == 2
     assert loaded.meta.session_id == sid
     assert loaded.meta.title == "测试会话"
     assert loaded.meta.turn_count == 2
+    assert len(loaded.messages) == 3
     assert len(loaded.history) == 3
+    assert isinstance(loaded.messages[0].parts[0], TextPart)
+
+    raw = json.loads(saved_path.read_text(encoding="utf-8"))
+    assert raw["schema_version"] == 2
+    assert "messages" in raw
+    assert "history" not in raw
+    assert "permission_memory" in raw
 
 
 def test_load_non_existent_session(tmp_path: Path) -> None:
@@ -175,3 +190,95 @@ def test_corrupt_session_file_ignored(tmp_path: Path) -> None:
 
     assert load_session("bad", sessions_dir=sessions_dir) is None
     assert list_sessions(sessions_dir=sessions_dir) == []
+
+
+def test_load_v1_session_migrates_and_resave_is_v2(tmp_path: Path) -> None:
+    sid = "v1_tool_round"
+    fixture = Path(__file__).parent / "fixtures" / "session_v1_tool_round.json"
+    v1 = {
+        "meta": {
+            "session_id": sid,
+            "workspace_root": tmp_path.as_posix(),
+            "created_at": "2026-08-18T10:00:00",
+            "updated_at": "2026-08-18T10:00:00",
+            "model": "gpt-4o",
+            "title": "旧会话",
+            "turn_count": 1,
+        },
+        "history": json.loads(fixture.read_text(encoding="utf-8")),
+    }
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    path = sessions_dir / f"{sid}.json"
+    path.write_text(json.dumps(v1), encoding="utf-8")
+
+    loaded = load_session(sid, sessions_dir=sessions_dir)
+    assert loaded is not None
+    assert loaded.schema_version == 2
+    assert len(loaded.messages) == 5
+    assert loaded.meta.title == "旧会话"
+    assert loaded.history[0]["role"] == "system"
+    assert loaded.history[3]["type"] == "function_call_output"
+
+    save_session(loaded, sessions_dir=sessions_dir)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert raw["schema_version"] == 2
+    assert "messages" in raw
+    assert "history" not in raw
+    assert len(raw["messages"]) == 5
+
+    reloaded = load_session(sid, sessions_dir=sessions_dir)
+    assert reloaded is not None
+    assert reloaded.schema_version == 2
+    assert len(reloaded.messages) == 5
+
+
+def test_list_sessions_reads_v1_and_v2_meta(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    ws = tmp_path.resolve().as_posix()
+
+    v1 = {
+        "meta": {
+            "session_id": "old_v1",
+            "workspace_root": ws,
+            "created_at": "2026-08-18T09:00:00",
+            "updated_at": "2026-08-18T09:00:00",
+            "model": "gpt-4o",
+            "title": "v1 会话",
+            "turn_count": 1,
+        },
+        "history": [{"role": "system", "content": "sys"}],
+    }
+    (sessions_dir / "old_v1.json").write_text(json.dumps(v1), encoding="utf-8")
+
+    s2 = SessionData(
+        meta=SessionMeta(
+            session_id="new_v2",
+            workspace_root=ws,
+            created_at="2026-08-18T12:00:00",
+            updated_at="2026-08-18T12:00:00",
+            model="gpt-4o",
+            title="v2 会话",
+            turn_count=2,
+        )
+    )
+    save_session(s2, sessions_dir=sessions_dir)
+
+    listed = list_sessions(sessions_dir=sessions_dir)
+    ids = {m.session_id for m in listed}
+    assert ids == {"old_v1", "new_v2"}
+
+
+def test_default_sessions_dir_chmod_mini_agent_home(tmp_path: Path, monkeypatch: object) -> None:
+    monkeypatch.delenv("MINI_AGENT_SESSIONS_DIR", raising=False)  # type: ignore[attr-defined]
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        "mini_agent.session.Path.home",
+        classmethod(lambda cls: tmp_path),
+    )
+
+    sessions_dir = get_default_sessions_dir()
+    home_dir = tmp_path / ".mini-agent"
+    assert sessions_dir == home_dir / "sessions"
+    assert home_dir.is_dir()
+    assert (home_dir.stat().st_mode & 0o777) == 0o700
