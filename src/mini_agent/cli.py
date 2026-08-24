@@ -24,6 +24,19 @@ from mini_agent.cost import (
     load_pricing_table,
     set_custom_pricing,
 )
+from mini_agent.events import (
+    AgentEvent,
+    CompactionNotice,
+    ModelStarted,
+    TokenDelta,
+    ToolFinished,
+    ToolStarted,
+    TurnCancelled,
+    TurnFailed,
+    TurnFinished,
+    TurnStarted,
+    UsageReported,
+)
 from mini_agent.gitutil import git_add_u, git_commit, git_diff, git_diff_head, list_untracked
 from mini_agent.llm import LLMClient, LLMError, OpenAIChatCompletionsClient
 from mini_agent.models import AgentConfig, PermissionClass, ToolResult
@@ -39,7 +52,6 @@ from mini_agent.providers import (
 )
 from mini_agent.session import (
     SessionData,
-    generate_session_id,
     get_latest_session,
     list_sessions,
     load_session,
@@ -111,6 +123,31 @@ class RichAgentEventListener(AgentEventListener):
         self.verbose = verbose
         self.interactive = interactive
         self._streamed_any = False
+
+    def on_event(self, event: AgentEvent) -> None:
+        if isinstance(event, TurnStarted):
+            self.on_turn_start(event.user_input)
+        elif isinstance(event, TokenDelta):
+            self.on_token(event.token)
+        elif isinstance(event, ModelStarted):
+            self.on_model_start()
+        elif isinstance(event, ToolStarted):
+            self.on_tool_start(event.name, event.arguments)
+        elif isinstance(event, ToolFinished):
+            self.on_tool_finished(event.name, event.result)
+        elif isinstance(event, UsageReported):
+            self.on_usage(event.usage, event.cost_cny, event.model)
+        elif isinstance(event, TurnFinished):
+            self.on_turn_finished(event.response)
+        elif isinstance(event, TurnCancelled):
+            if self._streamed_any:
+                self.console.print("\n")
+                self._streamed_any = False
+            self.console.print(f"[yellow]{event.response}[/yellow]\n")
+        elif isinstance(event, TurnFailed):
+            self.console.print(f"\n[bold red]执行错误[/bold red]: {event.error}\n")
+        elif isinstance(event, CompactionNotice) and self.verbose:
+            self.console.print(f"  [dim]上下文已压缩（丢弃 {event.dropped_count}）[/dim]")
 
     def on_turn_start(self, user_input: str) -> None:
         self._streamed_any = False
@@ -311,7 +348,7 @@ def render_help(console: Console) -> None:
     )
 
     console.print(tools_table)
-    console.print("[dim]提示：按 Ctrl-C 取消当前行输入，按 Ctrl-D 正常退出。[/dim]\n")
+    console.print("[dim]提示：按 Ctrl-C 取消当前输入或当前回合，按 Ctrl-D 正常退出。[/dim]\n")
 
 
 def render_providers_table(console: Console) -> None:
@@ -426,7 +463,7 @@ def _confirm_permission(agent: Agent, req: PermissionRequest) -> bool:
         return False
     reply = Reply.REJECT
     listener = agent.listener
-    if listener is not None and hasattr(listener, "on_permission_ask"):
+    if listener is not None:
         reply = listener.on_permission_ask(req)
     if reply == Reply.ALWAYS:
         agent.permission.remember(req, reply)
@@ -627,10 +664,10 @@ def repl_loop(agent: Agent, console: Console) -> None:
                     if restore is not None:
                         restore(loaded.permission_memory or [])
                     agent.session = loaded
-                    agent.history = loaded.history
+                    agent.messages = loaded.messages
                     console.print(
                         f"[green]✔ 已成功恢复会话:[/green] [bold cyan]{target_id}[/bold cyan] "
-                        f"[dim]({loaded.meta.title}, {len(loaded.history)} 条记录)[/dim]\n"
+                        f"[dim]({loaded.meta.title}, {len(loaded.messages)} 条记录)[/dim]\n"
                     )
                 else:
                     console.print(f"[red]✗ 未找到指定的会话 ID: '{target_id}'[/red]\n")
@@ -641,12 +678,7 @@ def repl_loop(agent: Agent, console: Console) -> None:
             continue
 
         if user_input == "/new":
-            new_id = generate_session_id()
-            agent.__init__(
-                config=agent.config,
-                llm_client=agent.llm_client,
-                listener=agent.listener,
-            )
+            new_id = agent.reset_session()
             console.print(
                 f"[green]✔ 已重置上下文，开启全新会话:[/green] [bold cyan]{new_id}[/bold cyan]\n"
             )
@@ -673,6 +705,9 @@ def repl_loop(agent: Agent, console: Console) -> None:
 
         try:
             agent.step(user_input)
+        except KeyboardInterrupt:
+            agent.request_cancel()
+            console.print("\n[yellow]已取消当前回合[/yellow]")
         except NonInteractiveAskError as exc:
             console.print(
                 "\n[bold red]需要确认才能执行该操作。非交互模式请传递 -y/--yes。[/bold red]\n"

@@ -2,6 +2,7 @@
 
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,7 @@ from mini_agent.models import (
 )
 from mini_agent.repomap import generate_repo_map
 from mini_agent.syntax_guard import validate_syntax
-from mini_agent.tools.protocol import ToolContext, ToolKind
+from mini_agent.tools.protocol import ToolCancelled, ToolContext, ToolKind
 
 IGNORED_NAMES = {
     ".git",
@@ -670,6 +671,7 @@ def search_code(
     input_data: SearchCodeInput,
     workspace_root: Path,
     max_output_chars: int = 12_000,
+    cancel: threading.Event | None = None,
 ) -> ToolResult:
     """Recursively search for regex pattern or text across workspace text files."""
     resolved_path, err = resolve_relative_path(workspace_root, input_data.path)
@@ -722,6 +724,8 @@ def search_code(
     resolved_root = workspace_root.resolve()
 
     for fp in files_to_search:
+        if cancel is not None and cancel.is_set():
+            raise ToolCancelled
         if len(matches) >= input_data.max_results:
             break
         try:
@@ -830,6 +834,7 @@ class SearchCodeTool:
             inp,
             workspace_root=ctx.workspace_root,
             max_output_chars=ctx.config.max_output_chars,
+            cancel=ctx.cancel,
         )
 
     def format_call(self, inp: SearchCodeInput) -> str:

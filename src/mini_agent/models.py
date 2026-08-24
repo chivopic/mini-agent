@@ -28,8 +28,9 @@ class AgentConfig(BaseModel):
         description="OpenAI model identifier to use.",
     )
     max_tool_rounds: int = Field(
-        default=8,
-        gt=0,
+        default=32,
+        ge=1,
+        le=200,
         description="Maximum consecutive tool calling rounds allowed in a single turn.",
     )
     shell_timeout_seconds: int = Field(
@@ -41,6 +42,12 @@ class AgentConfig(BaseModel):
         default=12_000,
         gt=0,
         description="Maximum characters allowed in tool output before truncation.",
+    )
+    max_parallel_readonly: int = Field(
+        default=4,
+        ge=1,
+        le=8,
+        description="Maximum concurrent readonly tool executions in a single round.",
     )
 
     @field_validator("workspace_root", mode="before")

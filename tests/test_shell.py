@@ -1,6 +1,7 @@
 """Unit tests for controlled shell tool and security policies."""
 
 import sys
+import threading
 from pathlib import Path
 
 from mini_agent.models import RunShellInput
@@ -179,6 +180,25 @@ class TestShellExecution:
         assert result.ok is True
         assert result.metadata["truncated"] is True
         assert "已省略" in result.content
+
+    def test_command_cancel(self, tmp_path: Path) -> None:
+        py_cmd = f'{sys.executable} -c "import time; time.sleep(5)"'
+        cancel = threading.Event()
+
+        def trigger() -> None:
+            cancel.set()
+
+        threading.Timer(0.2, trigger).start()
+        result = run_shell(
+            RunShellInput(command=py_cmd),
+            workspace_root=tmp_path,
+            confirmed=True,
+            timeout_seconds=10,
+            cancel=cancel,
+        )
+        assert result.ok is False
+        assert result.metadata.get("user_cancelled") is True
+        assert "取消" in (result.error or "")
 
     def test_command_timeout(self, tmp_path: Path) -> None:
         py_cmd = f'{sys.executable} -c "import time; time.sleep(5)"'

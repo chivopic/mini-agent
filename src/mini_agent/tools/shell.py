@@ -6,6 +6,7 @@ import re
 import shlex
 import signal
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -240,6 +241,92 @@ def check_command_safety(command: str) -> tuple[bool, bool, str | None]:
     return False, True, f"命令不在只读白名单内，需要用户确认方可执行: '{stripped}'"
 
 
+class _ShellCancelledError(Exception):
+    """Internal: communicate aborted because cancel was set."""
+
+
+def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+    """SIGTERM the process group, then SIGKILL. Windows: terminate then kill."""
+    if process.poll() is not None:
+        return
+
+    def _signal(sig_unix: int, fallback: str) -> None:
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(os.getpgid(process.pid), sig_unix)
+                return
+            except OSError:
+                pass
+        try:
+            if fallback == "terminate":
+                process.terminate()
+            else:
+                process.kill()
+        except OSError:
+            pass
+
+    _signal(signal.SIGTERM, "terminate")
+    try:
+        process.communicate(timeout=2)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        pass
+    _signal(signal.SIGKILL, "kill")
+    try:
+        process.communicate(timeout=2)
+    except Exception:
+        pass
+
+
+def _communicate(
+    process: subprocess.Popen[str],
+    timeout_seconds: int,
+    cancel: threading.Event | None,
+) -> tuple[str, str]:
+    """Wait for stdout/stderr. Cancel uses the same kill path as TimeoutExpired."""
+    if cancel is None:
+        return process.communicate(timeout=timeout_seconds)
+
+    done = threading.Event()
+    box: dict[str, object] = {}
+
+    def waiter() -> None:
+        try:
+            box["result"] = process.communicate(timeout=timeout_seconds)
+        except Exception as exc:
+            box["exc"] = exc
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=waiter, daemon=True, name="run_shell_communicate")
+    thread.start()
+    try:
+        while not done.wait(0.05):
+            if cancel.is_set():
+                _terminate_process_group(process)
+                done.wait(3)
+                raise _ShellCancelledError
+    except KeyboardInterrupt:
+        if cancel is not None:
+            cancel.set()
+        _terminate_process_group(process)
+        done.wait(3)
+        raise
+
+    if cancel.is_set():
+        _terminate_process_group(process)
+        raise _ShellCancelledError
+    if "exc" in box:
+        raise box["exc"]  # type: ignore[misc]
+    result = box["result"]
+    if not isinstance(result, tuple) or len(result) != 2:
+        return "", ""
+    stdout_data, stderr_data = result
+    return str(stdout_data or ""), str(stderr_data or "")
+
+
 def run_shell(
     input_data: RunShellInput,
     workspace_root: Path,
@@ -247,6 +334,7 @@ def run_shell(
     timeout_seconds: int = 30,
     max_output_chars: int = 12_000,
     custom_env: dict[str, str] | None = None,
+    cancel: threading.Event | None = None,
 ) -> ToolResult:
     """Execute a controlled shell command in the workspace directory."""
     command = input_data.command.strip()
@@ -285,24 +373,19 @@ def run_shell(
             start_new_session=True,
         )
 
-        stdout_data, stderr_data = process.communicate(timeout=timeout_seconds)
+        stdout_data, stderr_data = _communicate(process, timeout_seconds, cancel)
         exit_code = process.returncode
 
+    except _ShellCancelledError:
+        return ToolResult(
+            ok=False,
+            content="",
+            error="用户取消",
+            metadata={"command": command, "user_cancelled": True, "exit_code": -1},
+        )
     except subprocess.TimeoutExpired:
         if process is not None:
-            # Terminate the entire process group
-            try:
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-            except OSError:
-                pass
-            try:
-                stdout_data, stderr_data = process.communicate(timeout=2)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                except OSError:
-                    pass
-                stdout_data, stderr_data = "", ""
+            _terminate_process_group(process)
 
         return ToolResult(
             ok=False,
@@ -371,6 +454,7 @@ class RunShellTool:
             confirmed=True,
             timeout_seconds=ctx.config.shell_timeout_seconds,
             max_output_chars=ctx.config.max_output_chars,
+            cancel=ctx.cancel,
         )
 
     def format_call(self, inp: RunShellInput) -> str:

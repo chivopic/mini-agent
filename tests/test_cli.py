@@ -22,6 +22,7 @@ from mini_agent.cli import (
     run_cli,
 )
 from mini_agent.llm import FunctionCall, LLMClient, LLMResponse
+from mini_agent.messages import Message
 from mini_agent.models import AgentConfig, ToolResult
 from mini_agent.permission import DefaultPermissionService, Reply
 from mini_agent.session import SessionData, SessionMeta, save_session
@@ -37,10 +38,11 @@ class DummyLLM(LLMClient):
 
     def create_response(
         self,
-        history: list[dict[str, object]],
+        messages: list[Message],
         tools: list[dict[str, object]],
         model: str = "gpt-4o-mini",
         on_token: object = None,
+        cancel: object = None,
     ) -> LLMResponse:
         return LLMResponse(text=self.answer)
 
@@ -302,13 +304,14 @@ class TestCliReplExecution:
 
             def create_response(
                 self,
-                history: list[dict[str, object]],
+                messages: list[Message],
                 tools: list[dict[str, object]],
                 model: str = "gpt-4o-mini",
                 on_token: object = None,
+                cancel: object = None,
             ) -> LLMResponse:
                 self.tools_seen.append(tools)
-                return super().create_response(history, tools, model, on_token)
+                return super().create_response(messages, tools, model, on_token, cancel)
 
         llm = RecordingLLM()
         with patch("mini_agent.cli.OpenAIChatCompletionsClient", return_value=llm):
@@ -394,10 +397,11 @@ class TestCliReplExecution:
         class ShellLLM(LLMClient):
             def create_response(
                 self,
-                history: list[dict[str, object]],
+                messages: list[Message],
                 tools: list[dict[str, object]],
                 model: str = "gpt-4o-mini",
                 on_token: object = None,
+                cancel: object = None,
             ) -> LLMResponse:
                 return LLMResponse(
                     function_calls=[
@@ -422,10 +426,11 @@ class TestCliReplExecution:
 
             def create_response(
                 self,
-                history: list[dict[str, object]],
+                messages: list[Message],
                 tools: list[dict[str, object]],
                 model: str = "gpt-4o-mini",
                 on_token: object = None,
+                cancel: object = None,
             ) -> LLMResponse:
                 self.calls += 1
                 if self.calls == 1:

@@ -35,7 +35,7 @@ class TestDataModels:
         config = AgentConfig(workspace_root=tmp_path, model="gpt-4o")
         assert config.workspace_root == tmp_path.resolve()
         assert config.model == "gpt-4o"
-        assert config.max_tool_rounds == 8
+        assert config.max_tool_rounds == 32
 
     def test_agent_config_invalid_path(self, tmp_path: Path) -> None:
         non_existent = tmp_path / "does_not_exist"

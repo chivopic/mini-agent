@@ -1,5 +1,6 @@
 """Unit tests for permission evaluation order and always-memory."""
 
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,7 @@ import pytest
 
 from mini_agent.agent import Agent
 from mini_agent.llm import FunctionCall, LLMClient, LLMResponse
+from mini_agent.messages import Message
 from mini_agent.models import AgentConfig, PermissionClass
 from mini_agent.permission import (
     Decision,
@@ -35,10 +37,11 @@ class FakeLLMClient(LLMClient):
 
     def create_response(
         self,
-        history: list[dict[str, Any]],
+        messages: list[Message],
         tools: list[dict[str, Any]],
         model: str = "gpt-4o-mini",
         on_token: Callable[[str], None] | None = None,
+        cancel: threading.Event | None = None,
     ) -> LLMResponse:
         if not self.responses:
             return LLMResponse(text="[FakeLLM: No more responses configured]")
@@ -49,6 +52,9 @@ class AskListener:
     def __init__(self, reply: Reply = Reply.ALWAYS) -> None:
         self.asks: list[PermissionRequest] = []
         self.reply = reply
+
+    def on_event(self, event: object) -> None:
+        return
 
     def on_permission_ask(self, req: PermissionRequest) -> Reply:
         self.asks.append(req)

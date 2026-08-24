@@ -15,6 +15,7 @@ from mini_agent.llm import (
     OpenAIChatCompletionsClient,
     get_system_prompt,
 )
+from mini_agent.messages import Message, ToolResultPart
 from mini_agent.models import AgentConfig, PermissionClass, ToolResult
 from mini_agent.permission import PermissionRequest, Reply
 from mini_agent.tools import default_registry
@@ -24,16 +25,17 @@ from mini_agent.tools.protocol import ToolContext, ToolKind
 class FakeLLMClient(LLMClient):
     def __init__(self, responses: list[LLMResponse]) -> None:
         self.responses = list(responses)
-        self.call_history: list[list[dict[str, Any]]] = []
+        self.call_history: list[list[Message]] = []
 
     def create_response(
         self,
-        history: list[dict[str, Any]],
+        messages: list[Message],
         tools: list[dict[str, Any]],
         model: str = "gpt-4o-mini",
         on_token: Callable[[str], None] | None = None,
+        cancel: threading.Event | None = None,
     ) -> LLMResponse:
-        self.call_history.append(list(history))
+        self.call_history.append(list(messages))
         if not self.responses:
             return LLMResponse(text="[FakeLLM: No more responses configured]")
         return self.responses.pop(0)
@@ -42,6 +44,9 @@ class FakeLLMClient(LLMClient):
 class ConfirmListener:
     def __init__(self) -> None:
         self.confirm_calls: list[str] = []
+
+    def on_event(self, event: object) -> None:
+        return
 
     def on_permission_ask(self, req: PermissionRequest) -> Reply:
         self.confirm_calls.append(req.resource)
@@ -153,9 +158,13 @@ class TestAgentRegistryWiring:
         assert answer == "参数格式错误。"
         assert listener.confirm_calls == []
         tool_outputs = [
-            item for item in fake_llm.call_history[1] if item.get("type") == "function_call_output"
+            p
+            for msg in fake_llm.call_history[1]
+            for p in msg.parts
+            if isinstance(p, ToolResultPart)
         ]
-        assert "工具参数不是合法的 JSON 字符串" in tool_outputs[0]["output"]
+        assert tool_outputs[0].error is not None
+        assert "工具参数不是合法的 JSON 字符串" in tool_outputs[0].error
 
     def test_non_allowlisted_shell_confirmed_executes(self, tmp_path: Path) -> None:
         fake_llm = FakeLLMClient(
@@ -208,10 +217,13 @@ class TestAgentRegistryWiring:
         answer = agent.step("echo")
         assert answer == "pong 已收到。"
         tool_outputs = [
-            item for item in fake_llm.call_history[1] if item.get("type") == "function_call_output"
+            p
+            for msg in fake_llm.call_history[1]
+            for p in msg.parts
+            if isinstance(p, ToolResultPart)
         ]
         assert len(tool_outputs) == 1
-        assert "pong" in tool_outputs[0]["output"]
+        assert "pong" in tool_outputs[0].content
 
     def test_llm_reexports_get_system_prompt(self, tmp_path: Path) -> None:
         text = get_system_prompt(tmp_path)
