@@ -247,6 +247,19 @@ class TestReadFileTool:
         assert result.metadata["end_line"] == 2
         assert result.metadata["total_lines"] == 4
 
+    def test_ranged_read_exact_100kib_not_truncated(self, tmp_path: Path) -> None:
+        size = 100 * 1024
+        (tmp_path / "exact.txt").write_bytes(b"B" * (size - 1) + b"\n")
+        result = read_file(
+            ReadFileInput(path="exact.txt", offset=1),
+            workspace_root=tmp_path,
+        )
+        assert result.ok is True
+        assert result.metadata["truncated"] is False
+        assert result.metadata["total_lines"] == 1
+        assert result.metadata["end_line"] == 1
+        assert result.content == "B" * (size - 1) + "\n"
+
     def test_ranged_read_bounds_first_line_to_100kib(self, tmp_path: Path) -> None:
         (tmp_path / "huge.txt").write_bytes(b"A" * (100 * 1024 + 50) + b"\nsecond\n")
         result = read_file(
@@ -504,6 +517,27 @@ class TestEditFileTool:
         assert file_path.read_text(encoding="utf-8") == original
         leftovers = list(tmp_path.glob(".keep.py.tmp"))
         assert leftovers == []
+
+    def test_ranged_read_crlf_usable_as_edit_target(self, tmp_path: Path) -> None:
+        file_path = tmp_path / "app.py"
+        file_path.write_bytes(b"a = 1\r\nb = 2\r\nc = 3\r\n")
+        read_result = read_file(
+            ReadFileInput(path="app.py", offset=2, limit=1),
+            workspace_root=tmp_path,
+        )
+        assert read_result.ok is True
+        assert "\r" not in read_result.content
+        assert read_result.content == "b = 2\n"
+        result = edit_file(
+            EditFileInput(
+                path="app.py",
+                target_content=read_result.content,
+                replacement_content="b = 99\n",
+            ),
+            workspace_root=tmp_path,
+        )
+        assert result.ok is True
+        assert file_path.read_text(encoding="utf-8") == "a = 1\nb = 99\nc = 3\n"
 
     def test_ranged_read_content_usable_as_edit_target(self, tmp_path: Path) -> None:
         file_path = tmp_path / "app.py"

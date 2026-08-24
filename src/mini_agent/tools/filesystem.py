@@ -128,6 +128,11 @@ def _text_line_count(text: str) -> int:
     return text.count("\n") + (0 if text.endswith("\n") else 1)
 
 
+def _decode_text_line(raw: bytes, *, strict: bool) -> str:
+    text = raw.decode("utf-8") if strict else raw.decode("utf-8", errors="ignore")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 class _BinLines:
     """Binary line scanner that can unread leftover bytes without seeking."""
 
@@ -175,6 +180,10 @@ class _BinLines:
         while True:
             to_read = _READ_CHUNK if max_bytes is None else min(_READ_CHUNK, max_bytes - got)
             if to_read <= 0:
+                more = self._read(1)
+                if not more:
+                    return b"".join(parts), False
+                self._unread(more)
                 return b"".join(parts), True
             chunk = self._read(to_read)
             if not chunk:
@@ -231,7 +240,6 @@ def _read_text_range(
     nbytes = 0
     line_no = 0
     end_line = start_line - 1
-    stopped_for_bytes = False
     truncated_mid_line = False
 
     with open(resolved_path, "rb") as raw_handle:
@@ -244,20 +252,18 @@ def _read_text_range(
         while len(collected) < line_budget:
             remaining = max_bytes - nbytes
             if remaining <= 0:
-                stopped_for_bytes = True
                 break
             raw, hit_cap = scanner.read_line(remaining)
             if not raw:
                 break
             line_no += 1
             if hit_cap:
-                stopped_for_bytes = True
                 truncated_mid_line = True
                 if not collected:
-                    collected.append(raw.decode("utf-8", errors="ignore"))
+                    collected.append(_decode_text_line(raw, strict=False))
                     end_line = line_no
                 break
-            collected.append(raw.decode("utf-8"))
+            collected.append(_decode_text_line(raw, strict=True))
             nbytes += len(raw)
             end_line = line_no
 
@@ -274,8 +280,10 @@ def _read_text_range(
             "offset_past_eof": True,
         }
 
-    stopped_for_lines = extra > 0 and len(collected) >= line_budget and not stopped_for_bytes
-    truncated = stopped_for_bytes or (stopped_for_lines and (limit is None or limit > max_lines))
+    hit_internal_line_cap = (
+        extra > 0 and len(collected) >= line_budget and (limit is None or limit > max_lines)
+    )
+    truncated = truncated_mid_line or hit_internal_line_cap or extra > 0 and nbytes >= max_bytes
     return "".join(collected), {
         "truncated": truncated,
         "start_line": start_line,
