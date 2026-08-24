@@ -378,8 +378,12 @@ def cmd_config(ctx: CommandContext, args: str) -> DispatchResult:
 
 
 def cmd_cancel(ctx: CommandContext, args: str) -> DispatchResult:
-    ctx.agent.request_cancel()
-    ctx.console.print("[yellow]已取消当前回合[/yellow]\n")
+    # Idle only: calling request_cancel() here would set _last_sigint_at and
+    # make the next Ctrl-C within 2s exit the process.
+    ctx.console.print(
+        "[yellow]当前没有正在执行的回合。[/yellow] "
+        "[dim]模型回复或工具执行期间请按 Ctrl-C 取消。[/dim]\n"
+    )
     return DispatchResult.CONTINUE
 
 

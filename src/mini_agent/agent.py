@@ -630,8 +630,9 @@ class Agent:
 
         extra_tools=None uses the full registry. extra_tools=[] sends no tools.
         """
-        cleaned_input = user_input.strip()
-        if not cleaned_input:
+        # Keep interior indent from multiline paste; only drop surrounding newlines.
+        cleaned_input = user_input.strip("\n\r")
+        if not cleaned_input.strip():
             return ""
 
         self._cancel.clear()

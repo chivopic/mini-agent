@@ -6,6 +6,7 @@ import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import typer
 from prompt_toolkit.formatted_text import HTML
@@ -36,7 +37,11 @@ def use_prompt_toolkit() -> bool:
     return bool(sys.stdin.isatty() and sys.stdout.isatty())
 
 
-def create_prompt_session(*, history_file: Path | None = None) -> PromptSession[str]:
+def create_prompt_session(
+    *,
+    history_file: Path | None = None,
+    **session_kwargs: Any,
+) -> PromptSession[str]:
     """File-backed history; Enter submits. Bracketed paste keeps newlines as one turn."""
     path = history_file if history_file is not None else default_history_path()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -49,7 +54,16 @@ def create_prompt_session(*, history_file: Path | None = None) -> PromptSession[
         history=FileHistory(str(path)),
         enable_history_search=True,
         multiline=False,
+        **session_kwargs,
     )
+
+
+def normalize_repl_input(raw: str) -> str:
+    """Keep interior indent; only drop surrounding newlines. Whitespace-only is empty."""
+    text = raw.strip("\n\r")
+    if not text.strip():
+        return ""
+    return text
 
 
 def read_repl_line(
@@ -58,8 +72,10 @@ def read_repl_line(
 ) -> str:
     """Read one user turn. prompt_toolkit when a session is provided; Rich Prompt otherwise."""
     if session is not None:
-        return str(session.prompt(HTML("<ansicyan><b>&gt; </b></ansicyan>"))).strip()
-    return Prompt.ask("[bold cyan]>[/bold cyan]", console=console).strip()
+        raw = str(session.prompt(HTML("<ansicyan><b>&gt; </b></ansicyan>")))
+    else:
+        raw = Prompt.ask("[bold cyan]>[/bold cyan]", console=console)
+    return normalize_repl_input(raw)
 
 
 def _handle_keyboard_interrupt(agent: Agent, console: Console, *, during_step: bool) -> None:

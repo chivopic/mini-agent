@@ -6,10 +6,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from prompt_toolkit.history import FileHistory, InMemoryHistory
+from prompt_toolkit.history import FileHistory
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
-from prompt_toolkit.shortcuts import PromptSession
 from rich.console import Console
 
 from mini_agent.agent import Agent
@@ -19,6 +18,7 @@ from mini_agent.commands import (
     SlashCommand,
     apply_loaded_session,
     build_command_registry,
+    cmd_cancel,
     cmd_config,
     cmd_new,
     help_rows,
@@ -29,7 +29,12 @@ from mini_agent.llm import LLMClient, LLMResponse
 from mini_agent.messages import Message
 from mini_agent.models import AgentConfig
 from mini_agent.render import format_tool_call, render_help_tables
-from mini_agent.repl import create_prompt_session, default_history_path
+from mini_agent.repl import (
+    create_prompt_session,
+    default_history_path,
+    normalize_repl_input,
+    read_repl_line,
+)
 from mini_agent.session import SessionData, SessionMeta
 from mini_agent.tools import default_registry
 
@@ -153,6 +158,19 @@ def test_cmd_new_prints_stored_session_id(tmp_path: Path) -> None:
     assert stored in ctx.console.export_text()
 
 
+def test_cmd_cancel_idle_does_not_request_cancel(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path)
+    assert ctx.agent._last_sigint_at is None
+    assert not ctx.agent._cancel.is_set()
+    assert cmd_cancel(ctx, "") is DispatchResult.CONTINUE
+    assert ctx.agent._last_sigint_at is None
+    assert not ctx.agent._cancel.is_set()
+    assert not ctx.agent._double_sigint
+    out = ctx.console.export_text()
+    assert "当前没有正在执行的回合" in out
+    assert "Ctrl-C" in out
+
+
 def test_format_call_known_and_unknown_tools() -> None:
     registry = default_registry()
     assert format_tool_call("read_file", {"path": "main.py"}, registry) == "read_file path=main.py"
@@ -170,26 +188,34 @@ def test_create_prompt_session_uses_file_history(tmp_path: Path) -> None:
     assert isinstance(session.history, FileHistory)
 
 
-def test_prompt_toolkit_multiline_paste_is_one_turn() -> None:
+def test_normalize_repl_input_keeps_indent_drops_surrounding_newlines() -> None:
+    pasted = "    def foo():\n        pass\n"
+    assert normalize_repl_input(pasted) == "    def foo():\n        pass"
+    assert normalize_repl_input("   \n\t  ") == ""
+    assert normalize_repl_input("\nhello\n") == "hello"
+
+
+def test_prompt_toolkit_multiline_paste_is_one_turn(tmp_path: Path) -> None:
     with create_pipe_input() as pipe:
-        session: PromptSession[str] = PromptSession(
-            history=InMemoryHistory(),
+        session = create_prompt_session(
+            history_file=tmp_path / "history",
             input=pipe,
             output=DummyOutput(),
         )
-        pipe.send_text("\x1b[200~print(1)\nprint(2)\x1b[201~\n")
-        result = session.prompt("")
-        assert result == "print(1)\nprint(2)"
+        pipe.send_text("\x1b[200~    def foo():\n        pass\x1b[201~\n")
+        result = read_repl_line(Console(), session)
+        assert result == "    def foo():\n        pass"
 
 
-def test_prompt_toolkit_up_arrow_recalls_history() -> None:
-    history = InMemoryHistory(["previous command"])
+def test_prompt_toolkit_up_arrow_recalls_history(tmp_path: Path) -> None:
+    history_file = tmp_path / "history"
+    history_file.write_text("# 2020-01-01 00:00:00.000000\n+previous command\n", encoding="utf-8")
     with create_pipe_input() as pipe:
-        session: PromptSession[str] = PromptSession(
-            history=history,
+        session = create_prompt_session(
+            history_file=history_file,
             input=pipe,
             output=DummyOutput(),
         )
         pipe.send_text("\x1b[A\n")
-        result = session.prompt("")
+        result = read_repl_line(Console(), session)
         assert result == "previous command"

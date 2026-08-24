@@ -405,7 +405,8 @@ class TestCliReplExecution:
                     input="/cancel\n/exit\n",
                 )
         assert result.exit_code == 0
-        assert "已取消当前回合" in result.stdout
+        assert "当前没有正在执行的回合" in result.stdout
+        assert "Ctrl-C" in result.stdout
 
     def test_repl_cost_command(self, tmp_path: Path) -> None:
         dummy_llm = DummyLLM("test answer")
