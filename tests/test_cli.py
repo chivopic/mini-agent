@@ -22,6 +22,7 @@ from mini_agent.cli import (
     run_cli,
 )
 from mini_agent.llm import FunctionCall, LLMClient, LLMResponse
+from mini_agent.messages import Message
 from mini_agent.models import AgentConfig, ToolResult
 from mini_agent.permission import DefaultPermissionService, Reply
 from mini_agent.session import SessionData, SessionMeta, save_session
@@ -37,10 +38,11 @@ class DummyLLM(LLMClient):
 
     def create_response(
         self,
-        history: list[dict[str, object]],
+        messages: list[Message],
         tools: list[dict[str, object]],
         model: str = "gpt-4o-mini",
         on_token: object = None,
+        cancel: object = None,
     ) -> LLMResponse:
         return LLMResponse(text=self.answer)
 
@@ -302,13 +304,14 @@ class TestCliReplExecution:
 
             def create_response(
                 self,
-                history: list[dict[str, object]],
+                messages: list[Message],
                 tools: list[dict[str, object]],
                 model: str = "gpt-4o-mini",
                 on_token: object = None,
+                cancel: object = None,
             ) -> LLMResponse:
                 self.tools_seen.append(tools)
-                return super().create_response(history, tools, model, on_token)
+                return super().create_response(messages, tools, model, on_token, cancel)
 
         llm = RecordingLLM()
         with patch("mini_agent.cli.OpenAIChatCompletionsClient", return_value=llm):
@@ -390,14 +393,46 @@ class TestCliReplExecution:
         with patch("rich.prompt.Prompt.ask", side_effect=["你好", "/exit"]):
             run_cli(workspace=tmp_path, llm_client=dummy_llm)
 
+    def test_repl_double_ctrl_c_exits(self, tmp_path: Path) -> None:
+        clock = {"t": 10.0}
+
+        def factory(config: AgentConfig, client: LLMClient, listener: object) -> Agent:
+            return Agent(
+                config=config,
+                llm_client=client,
+                listener=listener,  # type: ignore[arg-type]
+                monotonic=lambda: clock["t"],
+            )
+
+        n = {"i": 0}
+
+        def fake_ask(*args: object, **kwargs: object) -> str:
+            n["i"] += 1
+            if n["i"] == 1:
+                raise KeyboardInterrupt
+            if n["i"] == 2:
+                clock["t"] = 11.0
+                raise KeyboardInterrupt
+            return "/exit"
+
+        with patch("rich.prompt.Prompt.ask", side_effect=fake_ask):
+            with pytest.raises(typer.Exit) as exc_info:
+                run_cli(
+                    workspace=tmp_path,
+                    llm_client=DummyLLM("x"),
+                    agent_factory=factory,
+                )
+        assert exc_info.value.exit_code == 0
+
     def test_oneshot_non_tty_ask_exits_2(self, tmp_path: Path, monkeypatch: Any) -> None:
         class ShellLLM(LLMClient):
             def create_response(
                 self,
-                history: list[dict[str, object]],
+                messages: list[Message],
                 tools: list[dict[str, object]],
                 model: str = "gpt-4o-mini",
                 on_token: object = None,
+                cancel: object = None,
             ) -> LLMResponse:
                 return LLMResponse(
                     function_calls=[
@@ -422,10 +457,11 @@ class TestCliReplExecution:
 
             def create_response(
                 self,
-                history: list[dict[str, object]],
+                messages: list[Message],
                 tools: list[dict[str, object]],
                 model: str = "gpt-4o-mini",
                 on_token: object = None,
+                cancel: object = None,
             ) -> LLMResponse:
                 self.calls += 1
                 if self.calls == 1:
