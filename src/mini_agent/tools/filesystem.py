@@ -7,12 +7,16 @@ from typing import Any
 
 from mini_agent.models import (
     EditFileInput,
+    GetRepoMapInput,
     ListFilesInput,
+    PermissionClass,
     ReadFileInput,
     SearchCodeInput,
     ToolResult,
     WriteFileInput,
 )
+from mini_agent.repomap import generate_repo_map
+from mini_agent.tools.protocol import ToolContext, ToolKind
 
 IGNORED_NAMES = {
     ".git",
@@ -553,3 +557,148 @@ def search_code(
             "truncated": is_trunc,
         },
     )
+
+
+def get_repo_map(input_data: GetRepoMapInput, workspace_root: Path) -> ToolResult:
+    """Build a repo map for a sandboxed relative path inside workspace."""
+    resolved_path, error = resolve_relative_path(workspace_root, input_data.path)
+    if error or resolved_path is None:
+        return ToolResult(
+            ok=False,
+            content="",
+            error=error,
+            metadata={"path": input_data.path},
+        )
+
+    if not resolved_path.exists():
+        return ToolResult(
+            ok=False,
+            content="",
+            error=f"指定的目录不存在: '{input_data.path}'",
+            metadata={"path": input_data.path},
+        )
+
+    repo_map = generate_repo_map(resolved_path)
+    return ToolResult(
+        ok=True,
+        content=repo_map if repo_map else "未在当前目录发现有效的代码文件与符号。",
+        metadata={"path": input_data.path},
+    )
+
+
+class GetRepoMapTool:
+    name = "get_repo_map"
+    description = (
+        "提取工作区各代码文件的类名、方法名与函数签名，生成全局代码骨架拓扑地图 (Repo Map)。"
+    )
+    permission = PermissionClass.READ
+    kind = ToolKind.READONLY
+    input_model = GetRepoMapInput
+
+    def execute(self, inp: GetRepoMapInput, ctx: ToolContext) -> ToolResult:
+        return get_repo_map(inp, workspace_root=ctx.workspace_root)
+
+    def format_call(self, inp: GetRepoMapInput) -> str:
+        return f"get_repo_map path={inp.path}"
+
+    def approval_pattern(self, inp: GetRepoMapInput) -> str:
+        return f"read:{inp.path}"
+
+
+class SearchCodeTool:
+    name = "search_code"
+    description = (
+        "在工作区文本文件中递归搜索关键词或正则表达式模式，返回匹配的文件路径、行号与代码行。"
+    )
+    permission = PermissionClass.READ
+    kind = ToolKind.READONLY
+    input_model = SearchCodeInput
+
+    def execute(self, inp: SearchCodeInput, ctx: ToolContext) -> ToolResult:
+        return search_code(
+            inp,
+            workspace_root=ctx.workspace_root,
+            max_output_chars=ctx.config.max_output_chars,
+        )
+
+    def format_call(self, inp: SearchCodeInput) -> str:
+        return f"search_code pattern={inp.pattern!r} path={inp.path}"
+
+    def approval_pattern(self, inp: SearchCodeInput) -> str:
+        return f"read:{inp.path}"
+
+
+class ListFilesTool:
+    name = "list_files"
+    description = "列出工作区内指定相对目录的文件和子目录结构。"
+    permission = PermissionClass.READ
+    kind = ToolKind.READONLY
+    input_model = ListFilesInput
+
+    def execute(self, inp: ListFilesInput, ctx: ToolContext) -> ToolResult:
+        return list_files(
+            inp,
+            workspace_root=ctx.workspace_root,
+            max_output_chars=ctx.config.max_output_chars,
+        )
+
+    def format_call(self, inp: ListFilesInput) -> str:
+        return f"list_files path={inp.path} max_depth={inp.max_depth}"
+
+    def approval_pattern(self, inp: ListFilesInput) -> str:
+        return f"read:{inp.path}"
+
+
+class ReadFileTool:
+    name = "read_file"
+    description = "读取工作区内指定 UTF-8 文本文件的内容。"
+    permission = PermissionClass.READ
+    kind = ToolKind.READONLY
+    input_model = ReadFileInput
+
+    def execute(self, inp: ReadFileInput, ctx: ToolContext) -> ToolResult:
+        return read_file(
+            inp,
+            workspace_root=ctx.workspace_root,
+            max_output_chars=ctx.config.max_output_chars,
+        )
+
+    def format_call(self, inp: ReadFileInput) -> str:
+        return f"read_file path={inp.path}"
+
+    def approval_pattern(self, inp: ReadFileInput) -> str:
+        return f"read:{inp.path}"
+
+
+class EditFileTool:
+    name = "edit_file"
+    description = "在已有文件中精准搜索 target_content 并替换为 replacement_content。"
+    permission = PermissionClass.EDIT
+    kind = ToolKind.MUTATING
+    input_model = EditFileInput
+
+    def execute(self, inp: EditFileInput, ctx: ToolContext) -> ToolResult:
+        return edit_file(inp, workspace_root=ctx.workspace_root)
+
+    def format_call(self, inp: EditFileInput) -> str:
+        return f"edit_file path={inp.path}"
+
+    def approval_pattern(self, inp: EditFileInput) -> str:
+        return f"edit:{inp.path}"
+
+
+class WriteFileTool:
+    name = "write_file"
+    description = "创建新文件或覆盖写入完整内容。"
+    permission = PermissionClass.EDIT
+    kind = ToolKind.MUTATING
+    input_model = WriteFileInput
+
+    def execute(self, inp: WriteFileInput, ctx: ToolContext) -> ToolResult:
+        return write_file(inp, workspace_root=ctx.workspace_root)
+
+    def format_call(self, inp: WriteFileInput) -> str:
+        return f"write_file path={inp.path}"
+
+    def approval_pattern(self, inp: WriteFileInput) -> str:
+        return f"edit:{inp.path}"

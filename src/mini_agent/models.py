@@ -1,9 +1,19 @@
 """Data models and configuration contracts for mini-agent."""
 
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
+
+
+class PermissionClass(StrEnum):
+    """Permission category for a tool."""
+
+    READ = "read"
+    EDIT = "edit"
+    SHELL = "shell"
+    GIT = "git"
 
 
 class AgentConfig(BaseModel):

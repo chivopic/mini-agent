@@ -289,6 +289,30 @@ class TestAgentLoop:
         assert answer == ""
         assert len(fake_llm.call_history) == 0
 
+    def test_non_allowlisted_command_user_confirmed(self, tmp_path: Path) -> None:
+        fake_llm = FakeLLMClient(
+            [
+                LLMResponse(
+                    function_calls=[
+                        FunctionCall(
+                            name="run_shell",
+                            call_id="call_shell_ok",
+                            arguments='{"command": "touch allowed.txt"}',
+                        )
+                    ]
+                ),
+                LLMResponse(text="已创建 allowed.txt。"),
+            ]
+        )
+        config = AgentConfig(workspace_root=tmp_path)
+        listener = RecordingEventListener(confirm_decision=True)
+        agent = Agent(config=config, llm_client=fake_llm, listener=listener)
+
+        answer = agent.step("创建文件")
+        assert "allowed.txt" in answer
+        assert (tmp_path / "allowed.txt").exists()
+        assert any(event[0] == "tool_confirm" for event in listener.events)
+
     def test_dangerous_command_user_rejected(self, tmp_path: Path) -> None:
         fake_llm = FakeLLMClient(
             [
