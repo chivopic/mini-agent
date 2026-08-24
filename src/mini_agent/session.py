@@ -7,7 +7,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
+
+from mini_agent.messages import (
+    Message,
+    UnpairedToolError,
+    assert_pairing,
+    history_v1_to_messages,
+    messages_to_v1_history,
+)
 
 
 class SessionMeta(BaseModel):
@@ -28,8 +36,14 @@ class SessionMeta(BaseModel):
 class SessionData(BaseModel):
     """Complete session data including conversation history."""
 
+    schema_version: int = 2
     meta: SessionMeta
-    history: list[dict[str, Any]] = Field(default_factory=list)
+    messages: list[Message] = Field(default_factory=list)
+    permission_memory: list[Any] = Field(default_factory=list)
+
+    @property
+    def history(self) -> list[dict[str, Any]]:
+        return messages_to_v1_history(self.messages)
 
 
 def get_default_sessions_dir() -> Path:
@@ -37,8 +51,13 @@ def get_default_sessions_dir() -> Path:
     custom_dir = os.environ.get("MINI_AGENT_SESSIONS_DIR")
     if custom_dir:
         path = Path(custom_dir).resolve()
-    else:
-        path = Path.home() / ".mini-agent" / "sessions"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    home_dir = Path.home() / ".mini-agent"
+    home_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(home_dir, 0o700)
+    path = home_dir / "sessions"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -52,6 +71,8 @@ def generate_session_id() -> str:
 
 def save_session(session: SessionData, sessions_dir: Path | None = None) -> Path:
     """Save session data to a JSON file atomically."""
+    assert_pairing(session.messages)
+
     target_dir = sessions_dir or get_default_sessions_dir()
     target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -69,17 +90,40 @@ def save_session(session: SessionData, sessions_dir: Path | None = None) -> Path
 
 
 def load_session(session_id: str, sessions_dir: Path | None = None) -> SessionData | None:
-    """Load a session by its ID."""
-    target_dir = sessions_dir or get_default_sessions_dir()
-    file_path = target_dir / f"{session_id}.json"
-    if not file_path.is_file():
+    """Load a session by its ID, migrating v1 history files to schema v2 in memory."""
+    path = (sessions_dir or get_default_sessions_dir()) / f"{session_id}.json"
+    if not path.is_file():
         return None
-
     try:
-        with open(file_path, encoding="utf-8") as f:
-            data = json.load(f)
-        return SessionData.model_validate(data)
-    except (json.JSONDecodeError, ValueError, OSError):
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    version = data.get("schema_version", 1)
+    try:
+        if version == 1:
+            meta = SessionMeta.model_validate(data["meta"])
+            raw_history = data.get("history") or []
+            if not isinstance(raw_history, list) or not all(
+                isinstance(item, dict) for item in raw_history
+            ):
+                return None
+            messages = history_v1_to_messages(raw_history, created_at=meta.created_at)
+            return SessionData(schema_version=2, meta=meta, messages=messages, permission_memory=[])
+        if version == 2:
+            sess = SessionData.model_validate(data)
+            assert_pairing(sess.messages)
+            return sess
+        return None
+    except (
+        UnpairedToolError,
+        ValidationError,
+        KeyError,
+        AssertionError,
+        TypeError,
+        AttributeError,
+    ):
         return None
 
 
@@ -96,15 +140,12 @@ def list_sessions(
     resolved_ws = workspace_root.resolve().as_posix() if workspace_root else None
 
     for file_path in target_dir.glob("*.json"):
-        try:
-            with open(file_path, encoding="utf-8") as f:
-                data = json.load(f)
-            meta_dict = data.get("meta", {})
-            meta = SessionMeta.model_validate(meta_dict)
-            if resolved_ws is None or meta.workspace_root == resolved_ws:
-                sessions.append(meta)
-        except Exception:
+        loaded = load_session(file_path.stem, sessions_dir=target_dir)
+        if loaded is None:
             continue
+        meta = loaded.meta
+        if resolved_ws is None or meta.workspace_root == resolved_ws:
+            sessions.append(meta)
 
     sessions.sort(key=lambda s: s.updated_at, reverse=True)
     return sessions

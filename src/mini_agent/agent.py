@@ -9,6 +9,14 @@ from pydantic import ValidationError
 from mini_agent.context import compact_history
 from mini_agent.cost import UsageStats, calculate_cost_cny
 from mini_agent.llm import LLMClient, get_system_prompt, get_tool_definitions
+from mini_agent.messages import (
+    Message,
+    TextPart,
+    ToolCallPart,
+    ToolResultPart,
+    history_v1_to_messages,
+    messages_to_v1_history,
+)
 from mini_agent.models import (
     AgentConfig,
     EditFileInput,
@@ -84,7 +92,7 @@ class Agent:
 
         if session is not None:
             self.session = session
-            self.history = session.history
+            self.messages: list[Message] = session.messages
         else:
             now_iso = datetime.now().isoformat()
             new_meta = SessionMeta(
@@ -96,10 +104,14 @@ class Agent:
                 title="新对话",
                 turn_count=0,
             )
-            self.history: list[dict[str, Any]] = [
-                {"role": "system", "content": get_system_prompt(self.config.workspace_root)}
+            self.messages = [
+                Message(
+                    role="system",
+                    parts=[TextPart(text=get_system_prompt(self.config.workspace_root))],
+                    created_at=now_iso,
+                )
             ]
-            self.session = SessionData(meta=new_meta, history=self.history)
+            self.session = SessionData(meta=new_meta, messages=self.messages)
 
         self.session_usage = UsageStats(
             prompt_tokens=self.session.meta.total_prompt_tokens,
@@ -107,6 +119,16 @@ class Agent:
             total_tokens=self.session.meta.total_prompt_tokens
             + self.session.meta.total_completion_tokens,
         )
+
+    @property
+    def history(self) -> list[dict[str, Any]]:
+        return messages_to_v1_history(self.messages)
+
+    @history.setter
+    def history(self, items: list[dict[str, Any]]) -> None:
+        created_at = self.session.meta.created_at
+        self.messages = history_v1_to_messages(items, created_at=created_at)
+        self.session.messages = self.messages
 
     def _on_token(self, token: str) -> None:
         """Forward streamed token to listener if present."""
@@ -281,7 +303,7 @@ class Agent:
         self.session.meta.total_completion_tokens += turn_usage.completion_tokens
         self.session.meta.total_cost_cny += cost
         self.session_usage = self.session_usage.add(turn_usage)
-        self.session.history = self.history
+        self.session.messages = self.messages
 
         save_session(self.session)
 
@@ -297,7 +319,7 @@ class Agent:
         if self.listener and hasattr(self.listener, "on_turn_start"):
             self.listener.on_turn_start(cleaned_input)
 
-        self.history.append({"role": "user", "content": cleaned_input})
+        self.messages.append(Message(role="user", parts=[TextPart(text=cleaned_input)]))
         turn_usage = UsageStats()
 
         for _ in range(self.config.max_tool_rounds):
@@ -314,22 +336,32 @@ class Agent:
 
             turn_usage = turn_usage.add(response.usage)
 
-            # Append raw response items or assistant message to history
-            if response.raw_output:
-                for out_item in response.raw_output:
-                    self.history.append(out_item)
-            elif response.text:
-                self.history.append({"role": "assistant", "content": response.text})
-
-            # If no function calls requested, we reached the final answer
             if not response.function_calls:
+                if response.text:
+                    self.messages.append(
+                        Message(role="assistant", parts=[TextPart(text=response.text)])
+                    )
                 final_answer = response.text or "(模型未返回文本内容)"
                 if self.listener and hasattr(self.listener, "on_turn_finished"):
                     self.listener.on_turn_finished(final_answer)
                 self._persist_session(cleaned_input, turn_usage)
                 return final_answer
 
-            # Process function calls in serial order
+            call_parts: list[TextPart | ToolCallPart] = []
+            if response.text:
+                call_parts.append(TextPart(text=response.text))
+            for call in response.function_calls:
+                call_parts.append(
+                    ToolCallPart(
+                        call_id=call.call_id,
+                        name=call.name,
+                        arguments=call.arguments,
+                    )
+                )
+            # Hold the unpaired call message in memory until results are appended.
+            self.messages.append(Message(role="assistant", parts=call_parts))
+
+            result_parts: list[ToolResultPart] = []
             for call in response.function_calls:
                 try:
                     args_dict = json.loads(call.arguments) if call.arguments.strip() else {}
@@ -344,14 +376,20 @@ class Agent:
                 if self.listener and hasattr(self.listener, "on_tool_finished"):
                     self.listener.on_tool_finished(call.name, result)
 
-                # Append function call output to history
-                self.history.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": call.call_id,
-                        "output": result.model_dump_json(),
-                    }
+                result_parts.append(
+                    ToolResultPart(
+                        call_id=call.call_id,
+                        name=call.name,
+                        ok=result.ok,
+                        content=result.content,
+                        error=result.error,
+                        metadata=result.metadata,
+                    )
                 )
+
+            self.messages.append(Message(role="assistant", parts=result_parts))
+            self.session.messages = self.messages
+            save_session(self.session)
 
         timeout_msg = "工具调用轮数已达到上限，请缩小任务范围后重试。"
         if self.listener and hasattr(self.listener, "on_turn_finished"):
