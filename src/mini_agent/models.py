@@ -80,6 +80,16 @@ class ReadFileInput(BaseModel):
         min_length=1,
         description="Relative path of the UTF-8 text file to read within workspace.",
     )
+    offset: int | None = Field(
+        default=None,
+        ge=1,
+        description="1-based start line. Omit with limit to start at line 1.",
+    )
+    limit: int | None = Field(
+        default=None,
+        ge=1,
+        description="Maximum number of lines to return from offset.",
+    )
 
 
 class ListFilesInput(BaseModel):
@@ -138,6 +148,12 @@ class EditFileInput(BaseModel):
     replacement_content: str = Field(
         ...,
         description="New replacement text to substitute for target_content.",
+    )
+    replace_all: bool = Field(
+        default=False,
+        description=(
+            "If true, replace every occurrence of target_content; if false, require a unique match."
+        ),
     )
 
 

@@ -217,3 +217,6 @@ class TestAgentRegistryWiring:
         text = get_system_prompt(tmp_path)
         assert "请严格遵守以下开发准则：" in text
         assert "`get_repo_map`" in text
+        assert "`read_file` 的 metadata 含行号" in text
+        assert "不要带行号前缀" in text
+        assert "uv run pytest" in text

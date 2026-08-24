@@ -15,6 +15,11 @@ _DEV_GUIDELINES = (
     "6. 所有文件路径必须相对于工作区根目录；工具执行完毕后，使用中文清晰解释修改的内容和原因。"
 )
 
+_RANGE_EDIT_HINT = (
+    "`read_file` 的 metadata 含行号；编辑时 `target_content` 必须是文件正文，不要带行号前缀。"
+)
+_TEST_AFTER_EDIT_HINT = "修改后如有测试，可通过 `run_shell` 执行 `uv run pytest`，不要自动跑测试。"
+
 
 def get_system_prompt(workspace_root: Path, registry: ToolRegistry | None = None) -> str:
     """Generate system instructions for the Agent with project rules if present."""
@@ -28,7 +33,7 @@ def get_system_prompt(workspace_root: Path, registry: ToolRegistry | None = None
         f"你是一个运行在工作区 '{workspace_root.as_posix()}' 的智能开发助手 (mini-agent)。\n"
         "你可以使用以下工具进行开发：\n"
         f"{bullets}\n\n"
-        f"{_DEV_GUIDELINES}"
+        f"{_DEV_GUIDELINES}\n{_RANGE_EDIT_HINT}\n{_TEST_AFTER_EDIT_HINT}"
     )
 
     project_rules = load_project_rules(workspace_root)

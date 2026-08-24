@@ -1,5 +1,6 @@
 """Unit tests for filesystem tools and data models."""
 
+import os
 from pathlib import Path
 
 import pytest
@@ -44,6 +45,13 @@ class TestDataModels:
     def test_read_file_input_validation(self) -> None:
         with pytest.raises(ValidationError):
             ReadFileInput(path="")
+        with pytest.raises(ValidationError):
+            ReadFileInput(path="a.txt", offset=0)
+        with pytest.raises(ValidationError):
+            ReadFileInput(path="a.txt", limit=0)
+        inp = ReadFileInput(path="a.txt")
+        assert inp.offset is None
+        assert inp.limit is None
 
     def test_list_files_input_validation(self) -> None:
         inp = ListFilesInput(path="src", max_depth=3)
@@ -62,6 +70,8 @@ class TestDataModels:
     def test_edit_file_input_validation(self) -> None:
         with pytest.raises(ValidationError):
             EditFileInput(path="a.py", target_content="", replacement_content="b")
+        inp = EditFileInput(path="a.py", target_content="a", replacement_content="b")
+        assert inp.replace_all is False
 
     def test_tool_result_structure(self) -> None:
         res = ToolResult(ok=True, content="test output")
@@ -158,6 +168,72 @@ class TestReadFileTool:
         assert result.ok is False
         assert "体积过大" in (result.error or "")
 
+    def test_read_file_range_no_line_prefixes(self, tmp_path: Path) -> None:
+        sample = tmp_path / "lines.txt"
+        sample.write_text("alpha\nbeta\ngamma\ndelta\nepsilon\n", encoding="utf-8")
+
+        result = read_file(
+            ReadFileInput(path="lines.txt", offset=2, limit=3),
+            workspace_root=tmp_path,
+        )
+        assert result.ok is True
+        assert result.content == "beta\ngamma\ndelta\n"
+        assert "L001:" not in result.content
+        assert "L002:" not in result.content
+        assert result.metadata["start_line"] == 2
+        assert result.metadata["end_line"] == 4
+        assert result.metadata["total_lines"] == 5
+        assert result.metadata["truncated"] is False
+        assert result.metadata["path"] == "lines.txt"
+
+    def test_read_ranged_oversized_file_allowed(self, tmp_path: Path) -> None:
+        big_file = tmp_path / "big.txt"
+        big_file.write_text("A" * 1500, encoding="utf-8")
+
+        result = read_file(
+            ReadFileInput(path="big.txt", offset=1, limit=1),
+            workspace_root=tmp_path,
+            max_file_bytes=1000,
+        )
+        assert result.ok is True
+        assert result.content == "A" * 1500
+        assert "L001:" not in result.content
+        assert result.metadata["start_line"] == 1
+        assert result.metadata["end_line"] == 1
+        assert result.metadata["total_lines"] == 1
+
+    def test_read_file_range_caps_at_400_lines(self, tmp_path: Path) -> None:
+        body = "\n".join(f"row{i}" for i in range(1, 501)) + "\n"
+        (tmp_path / "many.txt").write_text(body, encoding="utf-8")
+
+        result = read_file(
+            ReadFileInput(path="many.txt", offset=1, limit=500),
+            workspace_root=tmp_path,
+        )
+        assert result.ok is True
+        assert "L001:" not in result.content
+        assert result.content.startswith("row1\n")
+        assert result.content.endswith("row400\n")
+        assert "row401" not in result.content
+        assert result.metadata["start_line"] == 1
+        assert result.metadata["end_line"] == 400
+        assert result.metadata["total_lines"] == 500
+        assert result.metadata["truncated"] is True
+
+    def test_read_file_range_byte_cap(self, tmp_path: Path) -> None:
+        line = ("x" * 3000) + "\n"
+        (tmp_path / "wide.txt").write_text(line * 50, encoding="utf-8")
+
+        result = read_file(
+            ReadFileInput(path="wide.txt", offset=1),
+            workspace_root=tmp_path,
+        )
+        assert result.ok is True
+        assert result.metadata["truncated"] is True
+        assert result.metadata["total_lines"] == 50
+        assert len(result.content.encode("utf-8")) <= 100 * 1024
+        assert "L001:" not in result.content
+
 
 class TestListFilesTool:
     """Test list_files tool behavior."""
@@ -243,6 +319,30 @@ class TestWriteFileTool:
         assert result.ok is False
         assert "越界" in (result.error or "")
 
+    def test_write_invalid_syntax_does_not_land(self, tmp_path: Path) -> None:
+        existing = tmp_path / "bad.py"
+        existing.write_text("x = 1\n", encoding="utf-8")
+        inp = WriteFileInput(path="bad.py", content="def oops(\n")
+        result = write_file(inp, workspace_root=tmp_path)
+        assert result.ok is False
+        assert result.metadata.get("syntax_error") is True
+        assert existing.read_text(encoding="utf-8") == "x = 1\n"
+
+    def test_write_atomic_replace_failure_no_partial_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def boom(_src: object, _dst: object, *args: object, **kwargs: object) -> None:
+            raise OSError("simulated replace failure")
+
+        monkeypatch.setattr(os, "replace", boom)
+        inp = WriteFileInput(path="new.py", content="print(1)\n")
+        result = write_file(inp, workspace_root=tmp_path)
+        assert result.ok is False
+        assert "写入文件失败" in (result.error or "")
+        assert not (tmp_path / "new.py").exists()
+        leftovers = list(tmp_path.glob(".new.py.tmp")) + list(tmp_path.glob("*.tmp"))
+        assert leftovers == []
+
 
 class TestEditFileTool:
     """Test edit_file tool behavior."""
@@ -286,6 +386,79 @@ class TestEditFileTool:
         result = edit_file(inp, workspace_root=tmp_path)
         assert result.ok is False
         assert "匹配不唯一" in (result.error or "")
+        assert file_path.read_text(encoding="utf-8") == "val = 1\nval = 1\n"
+
+    def test_edit_file_replace_all(self, tmp_path: Path) -> None:
+        file_path = tmp_path / "dup.py"
+        file_path.write_text("val = 1\nval = 1\n", encoding="utf-8")
+
+        inp = EditFileInput(
+            path="dup.py",
+            target_content="val = 1",
+            replacement_content="val = 2",
+            replace_all=True,
+        )
+        result = edit_file(inp, workspace_root=tmp_path)
+        assert result.ok is True
+        assert file_path.read_text(encoding="utf-8") == "val = 2\nval = 2\n"
+        assert result.metadata["match_count"] == 2
+
+    def test_edit_syntax_error_file_unchanged(self, tmp_path: Path) -> None:
+        file_path = tmp_path / "mod.py"
+        original = "x = 1\n"
+        file_path.write_text(original, encoding="utf-8")
+        inp = EditFileInput(
+            path="mod.py",
+            target_content="x = 1",
+            replacement_content="def broken(",
+        )
+        result = edit_file(inp, workspace_root=tmp_path)
+        assert result.ok is False
+        assert result.metadata.get("syntax_error") is True
+        assert file_path.read_text(encoding="utf-8") == original
+
+    def test_edit_atomic_replace_failure_keeps_original(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        file_path = tmp_path / "keep.py"
+        original = "x = 1\n"
+        file_path.write_text(original, encoding="utf-8")
+
+        def boom(_src: object, _dst: object, *args: object, **kwargs: object) -> None:
+            raise OSError("simulated replace failure")
+
+        monkeypatch.setattr(os, "replace", boom)
+        inp = EditFileInput(
+            path="keep.py",
+            target_content="x = 1",
+            replacement_content="x = 2",
+        )
+        result = edit_file(inp, workspace_root=tmp_path)
+        assert result.ok is False
+        assert "保存修改失败" in (result.error or "")
+        assert file_path.read_text(encoding="utf-8") == original
+        leftovers = list(tmp_path.glob(".keep.py.tmp"))
+        assert leftovers == []
+
+    def test_ranged_read_content_usable_as_edit_target(self, tmp_path: Path) -> None:
+        file_path = tmp_path / "app.py"
+        file_path.write_text("a = 1\nb = 2\nc = 3\n", encoding="utf-8")
+        read_result = read_file(
+            ReadFileInput(path="app.py", offset=2, limit=1),
+            workspace_root=tmp_path,
+        )
+        assert read_result.ok is True
+        assert "L001:" not in read_result.content
+        result = edit_file(
+            EditFileInput(
+                path="app.py",
+                target_content=read_result.content,
+                replacement_content="b = 99\n",
+            ),
+            workspace_root=tmp_path,
+        )
+        assert result.ok is True
+        assert file_path.read_text(encoding="utf-8") == "a = 1\nb = 99\nc = 3\n"
 
 
 class TestTruncateHelper:
