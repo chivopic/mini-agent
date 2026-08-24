@@ -1,5 +1,7 @@
 # mini-agent：交给 Claude Code 的分阶段实施规范
 
+> **历史文档（0.1 MVP 规格）。** 本文件描述最初的分阶段实施规范，已不再反映当前产品行为。现行行为以 [README.md](README.md) 与 [docs/design-0.3-architecture.md](docs/design-0.3-architecture.md) 为准。
+
 > 用途：将本文件完整交给 Claude Code，作为从零实现 `mini-agent` 的唯一实施规格。  
 > 目标：实现一个可在终端交互、理解当前项目、读取文件、列目录、执行受控 shell 命令的 Python CLI Agent MVP。  
 > 约束：**严格按阶段执行。每次只完成一个阶段；在阶段末说明设计原因、验证结果、修改文件，并等待用户确认后才开始下一阶段。不要在第一轮生成所有代码。**
