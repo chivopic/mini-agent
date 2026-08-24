@@ -16,6 +16,7 @@ from mini_agent.llm import (
     get_system_prompt,
 )
 from mini_agent.models import AgentConfig, PermissionClass, ToolResult
+from mini_agent.permission import PermissionRequest, Reply
 from mini_agent.tools import default_registry
 from mini_agent.tools.protocol import ToolContext, ToolKind
 
@@ -42,9 +43,9 @@ class ConfirmListener:
     def __init__(self) -> None:
         self.confirm_calls: list[str] = []
 
-    def on_tool_confirm(self, command: str) -> bool:
-        self.confirm_calls.append(command)
-        return True
+    def on_permission_ask(self, req: PermissionRequest) -> Reply:
+        self.confirm_calls.append(req.resource)
+        return Reply.ONCE
 
 
 def _ctx(workspace: Path) -> ToolContext:

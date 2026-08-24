@@ -59,6 +59,46 @@ class TestCommandSafetyPolicy:
             assert req_conf is True, f"Command should require confirmation: {cmd}"
             assert reason is not None
 
+    def test_git_add_dot_and_all_blocked(self) -> None:
+        blocked_cmds = [
+            "git add .",
+            "git add ./",
+            "git add ./.",
+            'git add "./"',
+            "git -C . add .",
+            "git -C /tmp add ./",
+            "git --git-dir=/tmp/repo add .",
+            "git add -A",
+            "git add --all",
+            "git add -uA",
+        ]
+        for cmd in blocked_cmds:
+            is_blocked, req_conf, reason = check_command_safety(cmd)
+            assert is_blocked is True, f"Command should be blocked: {cmd}"
+            assert req_conf is False
+            assert reason is not None
+            assert "阻断" in reason
+
+    def test_git_add_u_not_blocked(self) -> None:
+        is_blocked, req_conf, reason = check_command_safety("git add -u")
+        assert is_blocked is False
+        assert req_conf is True
+        assert reason is not None
+
+    def test_uv_run_python_script_allowlisted_but_dash_c_is_not(self) -> None:
+        is_blocked, req_conf, reason = check_command_safety("uv run python script.py")
+        assert is_blocked is False
+        assert req_conf is False
+        is_blocked, req_conf, reason = check_command_safety("uv run python -c 'print(1)'")
+        assert is_blocked is False
+        assert req_conf is True
+        assert reason is not None
+
+    def test_git_add_specific_path_not_blocked(self) -> None:
+        is_blocked, req_conf, _reason = check_command_safety("git add src/a.py")
+        assert is_blocked is False
+        assert req_conf is True
+
 
 class TestEnvironmentSanitization:
     """Test stripping of sensitive environment variables."""
@@ -167,6 +207,16 @@ class TestShellExecution:
         cmd = "rm -rf /"
         result = run_shell(
             RunShellInput(command=cmd),
+            workspace_root=tmp_path,
+            confirmed=True,
+        )
+        assert result.ok is False
+        assert result.metadata.get("blocked") is True
+        assert "阻断" in (result.error or "")
+
+    def test_git_add_dot_blocked_before_execution(self, tmp_path: Path) -> None:
+        result = run_shell(
+            RunShellInput(command="git add ."),
             workspace_root=tmp_path,
             confirmed=True,
         )

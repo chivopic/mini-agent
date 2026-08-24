@@ -12,6 +12,7 @@ from mini_agent.llm import (
     OpenAIChatCompletionsClient,
 )
 from mini_agent.models import AgentConfig, ToolResult
+from mini_agent.permission import PermissionRequest, Reply
 from mini_agent.session import load_session
 
 
@@ -59,9 +60,9 @@ class RecordingEventListener(AgentEventListener):
     def on_tool_start(self, tool_name: str, arguments: dict[str, Any]) -> None:
         self.events.append(("tool_start", (tool_name, arguments)))
 
-    def on_tool_confirm(self, command: str) -> bool:
-        self.events.append(("tool_confirm", command))
-        return self.confirm_decision
+    def on_permission_ask(self, req: PermissionRequest) -> Reply:
+        self.events.append(("permission_ask", req))
+        return Reply.ONCE if self.confirm_decision else Reply.REJECT
 
     def on_tool_finished(self, tool_name: str, result: ToolResult) -> None:
         self.events.append(("tool_finished", (tool_name, result)))
@@ -311,7 +312,7 @@ class TestAgentLoop:
         answer = agent.step("创建文件")
         assert "allowed.txt" in answer
         assert (tmp_path / "allowed.txt").exists()
-        assert any(event[0] == "tool_confirm" for event in listener.events)
+        assert any(event[0] == "permission_ask" for event in listener.events)
 
     def test_dangerous_command_user_rejected(self, tmp_path: Path) -> None:
         fake_llm = FakeLLMClient(
@@ -436,3 +437,49 @@ class TestAgentLoop:
         answer = agent.step("查找用户函数在哪里")
         assert "find_user_by_id" in answer
         assert len(agent.history) >= 4
+
+    def test_extra_tools_empty_sends_no_tools(self, tmp_path: Path) -> None:
+        class ToolsLLM(FakeLLMClient):
+            def __init__(self) -> None:
+                super().__init__([LLMResponse(text="feat: x")])
+                self.tools_args: list[list[dict[str, Any]]] = []
+
+            def create_response(
+                self,
+                history: list[dict[str, Any]],
+                tools: list[dict[str, Any]],
+                model: str = "gpt-4o-mini",
+                on_token: Callable[[str], None] | None = None,
+            ) -> LLMResponse:
+                self.tools_args.append(tools)
+                return super().create_response(history, tools, model, on_token)
+
+        llm = ToolsLLM()
+        agent = Agent(config=AgentConfig(workspace_root=tmp_path), llm_client=llm)
+        answer = agent.step("生成提交说明", extra_tools=[])
+        assert answer == "feat: x"
+        assert llm.tools_args == [[]]
+
+    def test_extra_tools_empty_does_not_dispatch_function_calls(self, tmp_path: Path) -> None:
+        fake_llm = FakeLLMClient(
+            [
+                LLMResponse(
+                    function_calls=[
+                        FunctionCall(
+                            name="write_file",
+                            call_id="call_hallucinated",
+                            arguments='{"path": "pwned.py", "content": "x"}',
+                        )
+                    ]
+                ),
+                LLMResponse(text="feat: no tools"),
+            ]
+        )
+        agent = Agent(config=AgentConfig(workspace_root=tmp_path), llm_client=fake_llm)
+        answer = agent.step("生成提交说明", extra_tools=[])
+        assert answer == "feat: no tools"
+        assert not (tmp_path / "pwned.py").exists()
+        outputs = [item for item in agent.history if item.get("type") == "function_call_output"]
+        assert len(outputs) == 1
+        assert outputs[0]["call_id"] == "call_hallucinated"
+        assert "未启用工具" in outputs[0]["output"]
