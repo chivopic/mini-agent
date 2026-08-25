@@ -59,3 +59,15 @@ def test_generate_repo_map(tmp_path: Path) -> None:
     assert "def run(self) -> None" in repo_map
     assert "src/utils.js:" in repo_map
     assert "function formatString" in repo_map
+
+
+def test_generate_repo_map_skips_external_file_symlink(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text("def outside_secret():\n    pass\n", encoding="utf-8")
+    (workspace / "linked.py").symlink_to(outside)
+
+    repo_map = generate_repo_map(workspace, boundary_root=workspace)
+
+    assert "outside_secret" not in repo_map

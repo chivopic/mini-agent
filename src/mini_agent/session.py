@@ -2,6 +2,8 @@
 
 import json
 import os
+import re
+import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +18,8 @@ from mini_agent.messages import (
     history_v1_to_messages,
     messages_to_v1_history,
 )
+
+SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
 
 class SessionMeta(BaseModel):
@@ -69,33 +73,73 @@ def generate_session_id() -> str:
     return f"{timestamp}_{random_suffix}"
 
 
+def is_valid_session_id(session_id: str) -> bool:
+    """Return whether a session ID is safe to use as a single filename stem."""
+    return bool(SESSION_ID_PATTERN.fullmatch(session_id))
+
+
+def _resolve_session_file(target_dir: Path, session_id: str) -> Path | None:
+    """Resolve a session file and reject traversal or an external symlink target."""
+    if not is_valid_session_id(session_id):
+        return None
+
+    resolved_dir = target_dir.resolve()
+    candidate = resolved_dir / f"{session_id}.json"
+    try:
+        resolved_candidate = candidate.resolve()
+    except OSError:
+        return None
+    if resolved_candidate.parent != resolved_dir:
+        return None
+    return candidate
+
+
 def save_session(session: SessionData, sessions_dir: Path | None = None) -> Path:
     """Save session data to a JSON file atomically."""
     assert_pairing(session.messages)
 
     target_dir = sessions_dir or get_default_sessions_dir()
     target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = target_dir.resolve()
 
-    file_path = target_dir / f"{session.meta.session_id}.json"
-    temp_path = target_dir / f"{session.meta.session_id}.tmp"
+    file_path = _resolve_session_file(target_dir, session.meta.session_id)
+    if file_path is None:
+        raise ValueError(f"非法会话 ID: '{session.meta.session_id}'")
 
     session.meta.updated_at = datetime.now().isoformat()
     json_str = session.model_dump_json(indent=2)
 
-    with open(temp_path, mode="w", encoding="utf-8") as f:
-        f.write(json_str)
-
-    temp_path.replace(file_path)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target_dir,
+            prefix=f".{session.meta.session_id}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            f.write(json_str)
+            f.flush()
+            os.fsync(f.fileno())
+            temp_path = Path(f.name)
+        temp_path.replace(file_path)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
     return file_path
 
 
 def load_session(session_id: str, sessions_dir: Path | None = None) -> SessionData | None:
     """Load a session by its ID, migrating v1 history files to schema v2 in memory."""
-    path = (sessions_dir or get_default_sessions_dir()) / f"{session_id}.json"
-    if not path.is_file():
+    target_dir = sessions_dir or get_default_sessions_dir()
+    file_path = _resolve_session_file(target_dir, session_id)
+    if file_path is None:
+        return None
+    if not file_path.is_file():
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(file_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(data, dict):
@@ -104,6 +148,8 @@ def load_session(session_id: str, sessions_dir: Path | None = None) -> SessionDa
     try:
         if version == 1:
             meta = SessionMeta.model_validate(data["meta"])
+            if meta.session_id != session_id:
+                return None
             raw_history = data.get("history") or []
             if not isinstance(raw_history, list) or not all(
                 isinstance(item, dict) for item in raw_history
@@ -113,6 +159,8 @@ def load_session(session_id: str, sessions_dir: Path | None = None) -> SessionDa
             return SessionData(schema_version=2, meta=meta, messages=messages, permission_memory=[])
         if version == 2:
             sess = SessionData.model_validate(data)
+            if sess.meta.session_id != session_id:
+                return None
             assert_pairing(sess.messages)
             return sess
         return None
@@ -135,7 +183,6 @@ def list_sessions(
     target_dir = sessions_dir or get_default_sessions_dir()
     if not target_dir.is_dir():
         return []
-
     sessions: list[SessionMeta] = []
     resolved_ws = workspace_root.resolve().as_posix() if workspace_root else None
 
@@ -166,7 +213,9 @@ def get_latest_session(
 def delete_session(session_id: str, sessions_dir: Path | None = None) -> bool:
     """Delete a session file by its ID."""
     target_dir = sessions_dir or get_default_sessions_dir()
-    file_path = target_dir / f"{session_id}.json"
+    file_path = _resolve_session_file(target_dir, session_id)
+    if file_path is None:
+        return False
     if file_path.is_file():
         try:
             file_path.unlink()

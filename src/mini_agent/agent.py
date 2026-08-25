@@ -2,6 +2,7 @@
 
 import json
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Protocol
 
 from pydantic import ValidationError
@@ -35,7 +36,14 @@ from mini_agent.session import (
     generate_session_id,
     save_session,
 )
-from mini_agent.tools.filesystem import edit_file, list_files, read_file, search_code, write_file
+from mini_agent.tools.filesystem import (
+    edit_file,
+    list_files,
+    read_file,
+    resolve_relative_path,
+    search_code,
+    write_file,
+)
 from mini_agent.tools.shell import check_command_safety, run_shell
 
 
@@ -91,34 +99,52 @@ class Agent:
         self.tools = get_tool_definitions()
 
         if session is not None:
-            self.session = session
-            self.messages: list[Message] = session.messages
+            self.resume_session(session)
         else:
-            now_iso = datetime.now().isoformat()
-            new_meta = SessionMeta(
-                session_id=generate_session_id(),
-                workspace_root=self.config.workspace_root.as_posix(),
-                created_at=now_iso,
-                updated_at=now_iso,
-                model=self.config.model,
-                title="新对话",
-                turn_count=0,
-            )
-            self.messages = [
-                Message(
-                    role="system",
-                    parts=[TextPart(text=get_system_prompt(self.config.workspace_root))],
-                    created_at=now_iso,
-                )
-            ]
-            self.session = SessionData(meta=new_meta, messages=self.messages)
+            self._create_new_session()
 
-        self.session_usage = UsageStats(
-            prompt_tokens=self.session.meta.total_prompt_tokens,
-            completion_tokens=self.session.meta.total_completion_tokens,
-            total_tokens=self.session.meta.total_prompt_tokens
-            + self.session.meta.total_completion_tokens,
+    def _create_new_session(self) -> None:
+        """Create fresh in-memory session state for the current workspace."""
+        now_iso = datetime.now().isoformat()
+        new_meta = SessionMeta(
+            session_id=generate_session_id(),
+            workspace_root=self.config.workspace_root.as_posix(),
+            created_at=now_iso,
+            updated_at=now_iso,
+            model=self.config.model,
+            title="新对话",
+            turn_count=0,
         )
+        self.messages = [
+            Message(
+                role="system",
+                parts=[TextPart(text=get_system_prompt(self.config.workspace_root))],
+                created_at=now_iso,
+            )
+        ]
+        self.session = SessionData(meta=new_meta, messages=self.messages)
+        self.session_usage = UsageStats()
+
+    def resume_session(self, session: SessionData) -> None:
+        """Attach a same-workspace session and rebuild all derived usage state."""
+        session_workspace = Path(session.meta.workspace_root).resolve()
+        current_workspace = self.config.workspace_root.resolve()
+        if session_workspace != current_workspace:
+            raise ValueError(
+                f"会话工作区与当前工作区不一致: '{session_workspace}' != '{current_workspace}'"
+            )
+        self.session = session
+        self.messages = session.messages
+        self.session_usage = UsageStats(
+            prompt_tokens=session.meta.total_prompt_tokens,
+            completion_tokens=session.meta.total_completion_tokens,
+            total_tokens=session.meta.total_prompt_tokens + session.meta.total_completion_tokens,
+        )
+
+    def reset_session(self) -> str:
+        """Reset context and return the actual ID of the newly active session."""
+        self._create_new_session()
+        return self.session.meta.session_id
 
     @property
     def history(self) -> list[dict[str, Any]]:
@@ -156,7 +182,14 @@ class Agent:
         if name == "get_repo_map":
             try:
                 inp = GetRepoMapInput(**args)
-                target_dir = self.config.workspace_root / inp.path
+                target_dir, path_error = resolve_relative_path(self.config.workspace_root, inp.path)
+                if path_error or target_dir is None:
+                    return ToolResult(
+                        ok=False,
+                        content="",
+                        error=path_error,
+                        metadata={"path": inp.path},
+                    )
                 if not target_dir.exists():
                     return ToolResult(
                         ok=False,
@@ -164,7 +197,17 @@ class Agent:
                         error=f"指定的目录不存在: '{inp.path}'",
                         metadata={"path": inp.path},
                     )
-                repo_map = generate_repo_map(target_dir)
+                if not target_dir.is_dir():
+                    return ToolResult(
+                        ok=False,
+                        content="",
+                        error=f"指定的路径不是目录: '{inp.path}'",
+                        metadata={"path": inp.path},
+                    )
+                repo_map = generate_repo_map(
+                    target_dir,
+                    boundary_root=self.config.workspace_root,
+                )
                 return ToolResult(
                     ok=True,
                     content=repo_map if repo_map else "未在当前目录发现有效的代码文件与符号。",
@@ -310,11 +353,23 @@ class Agent:
         if self.listener and hasattr(self.listener, "on_usage"):
             self.listener.on_usage(turn_usage, cost, self.config.model)
 
-    def step(self, user_input: str) -> str:
+    def step(
+        self,
+        user_input: str,
+        *,
+        tool_definitions: list[dict[str, Any]] | None = None,
+    ) -> str:
         """Run a single user turn in the agent loop."""
         cleaned_input = user_input.strip()
         if not cleaned_input:
             return ""
+
+        active_tools = self.tools if tool_definitions is None else tool_definitions
+        allowed_tool_names = {
+            str(tool.get("name"))
+            for tool in active_tools
+            if isinstance(tool, dict) and tool.get("name")
+        }
 
         if self.listener and hasattr(self.listener, "on_turn_start"):
             self.listener.on_turn_start(cleaned_input)
@@ -329,7 +384,7 @@ class Agent:
             compacted_history = compact_history(self.history)
             response = self.llm_client.create_response(
                 compacted_history,
-                self.tools,
+                active_tools,
                 model=self.config.model,
                 on_token=self._on_token,
             )
@@ -371,7 +426,15 @@ class Agent:
                 if self.listener and hasattr(self.listener, "on_tool_start"):
                     self.listener.on_tool_start(call.name, args_dict)
 
-                result = self._execute_tool(call.name, call.arguments)
+                if call.name not in allowed_tool_names:
+                    result = ToolResult(
+                        ok=False,
+                        content="",
+                        error=f"模型请求了本轮未授权的工具: '{call.name}'",
+                        metadata={"tool_name": call.name, "not_offered": True},
+                    )
+                else:
+                    result = self._execute_tool(call.name, call.arguments)
 
                 if self.listener and hasattr(self.listener, "on_tool_finished"):
                     self.listener.on_tool_finished(call.name, result)

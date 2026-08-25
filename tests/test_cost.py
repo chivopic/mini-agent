@@ -32,17 +32,15 @@ def test_estimate_tokens_from_text() -> None:
 
 
 def test_deepseek_v4_series_pricing() -> None:
-    # deepseek-v4 standard: 1.0 in, 2.0 out
-    cost_v4 = calculate_cost_cny(1_000_000, 1_000_000, "deepseek-v4")
-    assert cost_v4 == 3.0
-
-    # deepseek-v4-flash: 0.5 in, 1.0 out
+    # Cache-miss input plus output, converted to CNY at the documented approximate rate.
     cost_flash = calculate_cost_cny(1_000_000, 1_000_000, "deepseek-v4-flash")
-    assert cost_flash == 1.5
+    assert cost_flash == 3.03
 
-    # deepseek-v4-reasoner: 4.0 in, 16.0 out
-    cost_reasoner = calculate_cost_cny(1_000_000, 1_000_000, "deepseek-v4-reasoner")
-    assert cost_reasoner == 20.0
+    cost_pro = calculate_cost_cny(1_000_000, 1_000_000, "deepseek-v4-pro")
+    assert cost_pro == 9.39
+
+    # Historical session aliases retain a meaningful estimate.
+    assert calculate_cost_cny(1_000_000, 1_000_000, "deepseek-v4") == cost_flash
 
 
 def test_calculate_cost_ollama_free() -> None:

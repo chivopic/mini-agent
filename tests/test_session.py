@@ -385,3 +385,50 @@ def test_list_sessions_skips_unloadable_files(tmp_path: Path) -> None:
     assert ids == {"good"}
     assert load_session("unpaired_list", sessions_dir=sessions_dir) is None
     assert load_session("hist_str_list", sessions_dir=sessions_dir) is None
+
+
+def test_session_id_traversal_rejected_for_load_save_and_delete(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    outside = tmp_path / "outside.json"
+    outside_session = SessionData(
+        meta=SessionMeta(
+            session_id="../outside",
+            workspace_root=tmp_path.as_posix(),
+            created_at=datetime.now().isoformat(),
+            updated_at=datetime.now().isoformat(),
+            model="gpt-4o-mini",
+        )
+    )
+    outside.write_text(outside_session.model_dump_json(), encoding="utf-8")
+
+    assert load_session("../outside", sessions_dir=sessions_dir) is None
+    assert delete_session("../outside", sessions_dir=sessions_dir) is False
+    assert outside.exists()
+    with pytest.raises(ValueError, match="非法会话 ID"):
+        save_session(outside_session, sessions_dir=sessions_dir)
+
+
+def test_external_session_symlink_and_metadata_mismatch_ignored(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    outside = tmp_path / "external.json"
+    external_session = SessionData(
+        meta=SessionMeta(
+            session_id="linked",
+            workspace_root=tmp_path.as_posix(),
+            created_at=datetime.now().isoformat(),
+            updated_at=datetime.now().isoformat(),
+            model="gpt-4o-mini",
+        )
+    )
+    outside.write_text(external_session.model_dump_json(), encoding="utf-8")
+    (sessions_dir / "linked.json").symlink_to(outside)
+
+    mismatch = external_session.model_copy(deep=True)
+    mismatch.meta.session_id = "different"
+    (sessions_dir / "expected.json").write_text(mismatch.model_dump_json(), encoding="utf-8")
+
+    assert load_session("linked", sessions_dir=sessions_dir) is None
+    assert load_session("expected", sessions_dir=sessions_dir) is None
+    assert list_sessions(sessions_dir=sessions_dir) == []

@@ -23,19 +23,20 @@ class UsageStats(BaseModel):
         )
 
 
-# Built-in pricing per 1M tokens in CNY (RMB)
-# (Input price per 1M, Output price per 1M)
+# Built-in pricing per 1M tokens in CNY (RMB).
+# DeepSeek uses the cache-miss input rate because the current usage response does not expose a
+# cached-token split. USD prices are converted at an approximate USD/CNY rate of 7.2.
 BUILTIN_MODEL_PRICING_CNY: dict[str, tuple[float, float]] = {
-    # DeepSeek V4 Series (Latest)
-    "deepseek-v4-flash": (0.5, 1.0),
-    "deepseek-v4-pro": (2.0, 4.0),
-    "deepseek-v4-reasoner": (4.0, 16.0),
-    "deepseek-v4": (1.0, 2.0),
-    # DeepSeek V3 / R1 Legacy & Aliases
-    "deepseek-chat": (1.0, 2.0),
-    "deepseek-v3": (1.0, 2.0),
-    "deepseek-reasoner": (4.0, 16.0),
-    "deepseek-r1": (4.0, 16.0),
+    # DeepSeek V4 official API model names (pricing checked 2026-08-25)
+    "deepseek-v4-flash": (1.01, 2.02),
+    "deepseek-v4-pro": (3.13, 6.26),
+    # Historical aliases retained only so old session cost summaries remain meaningful.
+    "deepseek-v4-reasoner": (3.13, 6.26),
+    "deepseek-v4": (1.01, 2.02),
+    "deepseek-chat": (1.01, 2.02),
+    "deepseek-v3": (1.01, 2.02),
+    "deepseek-reasoner": (3.13, 6.26),
+    "deepseek-r1": (3.13, 6.26),
     # OpenAI (USD converted to approx CNY @ 7.2)
     "gpt-4o-mini": (1.08, 4.32),
     "gpt-4o": (18.0, 72.0),

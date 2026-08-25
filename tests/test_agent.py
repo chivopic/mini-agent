@@ -259,6 +259,30 @@ class TestAgentLoop:
         answer = agent.step("调用未知工具")
         assert answer == "未知工具已处理。"
 
+    def test_unoffered_tool_is_not_executed(self, tmp_path: Path) -> None:
+        fake_llm = FakeLLMClient(
+            [
+                LLMResponse(
+                    function_calls=[
+                        FunctionCall(
+                            name="write_file",
+                            call_id="call_unoffered",
+                            arguments='{"path": "unexpected.txt", "content": "unsafe"}',
+                        )
+                    ]
+                ),
+                LLMResponse(text="未执行工具。"),
+            ]
+        )
+        agent = Agent(AgentConfig(workspace_root=tmp_path), fake_llm)
+
+        answer = agent.step("只生成文本", tool_definitions=[])
+
+        assert answer == "未执行工具。"
+        assert not (tmp_path / "unexpected.txt").exists()
+        assert fake_llm.call_history[0][-1]["content"] == "只生成文本"
+        assert "未授权" in str(fake_llm.call_history[1])
+
     def test_max_tool_rounds_exceeded(self, tmp_path: Path) -> None:
         infinite_responses = [
             LLMResponse(
@@ -412,3 +436,20 @@ class TestAgentLoop:
         answer = agent.step("查找用户函数在哪里")
         assert "find_user_by_id" in answer
         assert len(agent.history) >= 4
+
+    def test_repo_map_rejects_workspace_traversal(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "workspace"
+        outside = tmp_path / "outside"
+        workspace.mkdir()
+        outside.mkdir()
+        (outside / "secret.py").write_text("def outside_secret():\n    pass\n", encoding="utf-8")
+
+        agent = Agent(
+            config=AgentConfig(workspace_root=workspace),
+            llm_client=FakeLLMClient([]),
+        )
+        result = agent._execute_tool("get_repo_map", '{"path": "../outside"}')
+
+        assert result.ok is False
+        assert "越界" in (result.error or "")
+        assert "outside_secret" not in result.content

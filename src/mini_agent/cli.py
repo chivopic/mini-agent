@@ -10,12 +10,14 @@ import typer
 from rich import box
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
+from mini_agent import __version__
 from mini_agent.agent import Agent, AgentEventListener
 from mini_agent.cost import (
     UsageStats,
@@ -32,11 +34,11 @@ from mini_agent.providers import (
 )
 from mini_agent.session import (
     SessionData,
-    generate_session_id,
     get_latest_session,
     list_sessions,
     load_session,
 )
+from mini_agent.tools.shell import sanitize_environment
 
 app = typer.Typer(
     name="mini-agent",
@@ -44,6 +46,31 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+
+DOTENV_ALLOWED_KEYS = {
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "MINI_AGENT_MODEL",
+    "MINI_AGENT_PRICING",
+}
+
+
+def run_git(
+    workspace: Path,
+    *args: str,
+    capture_output: bool = False,
+    check: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """Run Git without exposing API keys or cloud credentials to hooks and helpers."""
+    return subprocess.run(
+        ["git", *args],
+        cwd=workspace,
+        capture_output=capture_output,
+        text=True,
+        check=check,
+        env=sanitize_environment(),
+    )
 
 
 def render_banner(
@@ -56,7 +83,7 @@ def render_banner(
     content = Text()
     content.append("✦ ", style="bold cyan")
     content.append("MINI-AGENT", style="bold white")
-    content.append("  v0.2.0\n", style="dim")
+    content.append(f"  v{__version__}\n", style="dim")
     content.append("📁 工作区: ", style="bold bright_black")
     content.append(f"{workspace.as_posix()}\n", style="white")
     content.append("⚡ 模型:   ", style="bold bright_black")
@@ -114,52 +141,55 @@ class RichAgentEventListener(AgentEventListener):
         if tool_name == "get_repo_map":
             path = arguments.get("path", ".")
             self.console.print(
-                f"  [bold cyan]⚡ Tool: get_repo_map[/bold cyan] [dim](路径: {path})[/dim]"
+                f"  [bold cyan]⚡ Tool: get_repo_map[/bold cyan] "
+                f"[dim](路径: {escape(str(path))})[/dim]"
             )
         elif tool_name == "search_code":
             pattern = arguments.get("pattern", "")
             path = arguments.get("path", ".")
             self.console.print(
                 f"  [bold cyan]⚡ Tool: search_code[/bold cyan] "
-                f"[dim](模式: '{pattern}', 路径: {path})[/dim]"
+                f"[dim](模式: '{escape(str(pattern))}', 路径: {escape(str(path))})[/dim]"
             )
         elif tool_name == "read_file":
             path = arguments.get("path", "")
             self.console.print(
-                f"  [bold cyan]⚡ Tool: read_file[/bold cyan] [dim](路径: {path})[/dim]"
+                f"  [bold cyan]⚡ Tool: read_file[/bold cyan] "
+                f"[dim](路径: {escape(str(path))})[/dim]"
             )
         elif tool_name == "list_files":
             path = arguments.get("path", ".")
             depth = arguments.get("max_depth", 2)
             self.console.print(
                 f"  [bold cyan]⚡ Tool: list_files[/bold cyan] "
-                f"[dim](路径: {path}, 深度: {depth})[/dim]"
+                f"[dim](路径: {escape(str(path))}, 深度: {depth})[/dim]"
             )
         elif tool_name == "write_file":
             path = arguments.get("path", "")
             chars = len(arguments.get("content", ""))
             self.console.print(
                 f"  [bold cyan]⚡ Tool: write_file[/bold cyan] "
-                f"[dim](写入: {path}, {chars} 字符)[/dim]"
+                f"[dim](写入: {escape(str(path))}, {chars} 字符)[/dim]"
             )
         elif tool_name == "edit_file":
             path = arguments.get("path", "")
             self.console.print(
-                f"  [bold cyan]⚡ Tool: edit_file[/bold cyan] [dim](修改: {path})[/dim]"
+                f"  [bold cyan]⚡ Tool: edit_file[/bold cyan] "
+                f"[dim](修改: {escape(str(path))})[/dim]"
             )
         elif tool_name == "run_shell":
             cmd = arguments.get("command", "")
             self.console.print(
-                f"  [bold cyan]⚡ Tool: run_shell[/bold cyan] [dim](命令: {cmd})[/dim]"
+                f"  [bold cyan]⚡ Tool: run_shell[/bold cyan] [dim](命令: {escape(str(cmd))})[/dim]"
             )
         else:
-            self.console.print(f"  [bold cyan]⚡ Tool: {tool_name}[/bold cyan]")
+            self.console.print(f"  [bold cyan]⚡ Tool: {escape(tool_name)}[/bold cyan]")
 
     def on_tool_confirm(self, command: str) -> bool:
         self.console.print(
             Panel(
                 f"[yellow]Agent 请求执行以下非只读 Shell 命令：[/yellow]\n\n"
-                f"  [bold cyan]{command}[/bold cyan]\n\n"
+                f"  [bold cyan]{escape(command)}[/bold cyan]\n\n"
                 f"[dim]请确认该命令在当前工作区内执行是否安全。[/dim]",
                 title="[bold yellow]⚠️  安全确认 (Security Confirmation)[/bold yellow]",
                 box=box.ROUNDED,
@@ -189,7 +219,7 @@ class RichAgentEventListener(AgentEventListener):
             self.console.print(f"  [bold green]✔ 执行成功[/bold green]{extra_info}")
         else:
             reason = result.error or "未知错误"
-            self.console.print(f"  [bold red]✗ 执行失败[/bold red]: [red]{reason}[/red]")
+            self.console.print(f"  [bold red]✗ 执行失败[/bold red]: [red]{escape(reason)}[/red]")
 
     def on_usage(self, usage: UsageStats, cost_cny: float, model: str) -> None:
         cost_str = format_cost_cny(cost_cny)
@@ -219,7 +249,7 @@ def render_help(console: Console) -> None:
     table.add_column("说明与用途", style="white")
 
     table.add_row("/help", "显示快捷指令与 Agent 工具能力说明")
-    table.add_row("/provider [name]", "切换或查看各大模型服务商预设 (DeepSeek V4, Ollama 等)")
+    table.add_row("/provider [name]", "切换或查看模型服务商预设 (DeepSeek V4, Ollama 等)")
     table.add_row("/cost [set/list]", "查看 Token 消耗看板，或自定义/查看模型费率表")
     table.add_row("/diff", "查看当前工作区的所有 Git 代码改动")
     table.add_row("/commit [msg]", "智能生成或执行 Git 提交")
@@ -227,7 +257,7 @@ def render_help(console: Console) -> None:
     table.add_row("/resume <id>", "切换并恢复指定历史会话")
     table.add_row("/new", "重置并开启全新会话")
     table.add_row("/clear", "清屏并重新展示顶部状态 Banner")
-    table.add_row("/model [name]", "查看或临时切换当前模型 (如 /model deepseek-v4-flash)")
+    table.add_row("/model [name]", "查看或临时切换当前模型 (如 /model deepseek-v4-pro)")
     table.add_row("/exit, /quit", "退出当前 mini-agent 会话")
 
     console.print(table)
@@ -453,21 +483,23 @@ def repl_loop(agent: Agent, console: Console) -> None:
                 pname = parts[1].strip()
                 preset = get_provider_preset(pname)
                 if preset:
-                    agent.config.model = preset.default_model
-                    agent.session.meta.model = preset.default_model
                     try:
-                        agent.llm_client = OpenAIChatCompletionsClient(
+                        new_client = OpenAIChatCompletionsClient(
                             base_url=preset.base_url,
                         )
-                    except Exception:
-                        pass
-                    console.print(
-                        f"[green]✔ 已成功切换服务商:[/green] "
-                        f"[bold cyan]{preset.display_name}[/bold cyan] "
-                        f"[dim](模型: {preset.default_model})[/dim]\n"
-                    )
+                    except Exception as exc:
+                        console.print(f"[red]✗ 切换服务商失败: {escape(str(exc))}[/red]\n")
+                    else:
+                        agent.llm_client = new_client
+                        agent.config.model = preset.default_model
+                        agent.session.meta.model = preset.default_model
+                        console.print(
+                            f"[green]✔ 已成功切换服务商:[/green] "
+                            f"[bold cyan]{preset.display_name}[/bold cyan] "
+                            f"[dim](模型: {preset.default_model})[/dim]\n"
+                        )
                 else:
-                    console.print(f"[red]✗ 未知服务商预设: '{pname}'[/red]")
+                    console.print(f"[red]✗ 未知服务商预设: '{escape(pname)}'[/red]")
                     render_providers_table(console)
             else:
                 render_providers_table(console)
@@ -475,13 +507,22 @@ def repl_loop(agent: Agent, console: Console) -> None:
 
         if user_input == "/diff":
             try:
-                res = subprocess.run(
-                    ["git", "diff"],
-                    cwd=agent.config.workspace_root,
+                res = run_git(
+                    agent.config.workspace_root,
+                    "diff",
+                    "HEAD",
                     capture_output=True,
-                    text=True,
-                    check=False,
                 )
+                status_res = run_git(
+                    agent.config.workspace_root,
+                    "status",
+                    "--short",
+                    capture_output=True,
+                )
+                if res.returncode != 0 or status_res.returncode != 0:
+                    detail = res.stderr or status_res.stderr or "当前目录可能不是 Git 仓库"
+                    console.print(f"[red]✗ 执行 git diff 失败: {escape(detail.strip())}[/red]\n")
+                    continue
                 if res.stdout.strip():
                     console.print(
                         Syntax(
@@ -491,36 +532,56 @@ def repl_loop(agent: Agent, console: Console) -> None:
                             line_numbers=False,
                         )
                     )
-                else:
-                    console.print("[dim green]✔ 工作区代码干净，无未暂存的代码改动。[/dim green]\n")
+                if status_res.stdout.strip():
+                    console.print("[bold cyan]Git 状态（含未跟踪文件）[/bold cyan]")
+                    console.print(status_res.stdout, markup=False)
+                if not res.stdout.strip() and not status_res.stdout.strip():
+                    console.print("[dim green]✔ 工作区代码干净，无待提交改动。[/dim green]\n")
             except Exception as exc:
-                console.print(f"[red]✗ 执行 git diff 失败: {exc}[/red]\n")
+                console.print(f"[red]✗ 执行 git diff 失败: {escape(str(exc))}[/red]\n")
             continue
 
         if user_input.startswith("/commit"):
             parts = user_input.split(maxsplit=1)
             msg = parts[1].strip() if len(parts) > 1 else ""
+            try:
+                status_res = run_git(
+                    agent.config.workspace_root,
+                    "status",
+                    "--short",
+                    capture_output=True,
+                )
+            except Exception as exc:
+                console.print(f"[red]✗ 读取 Git 状态失败: {escape(str(exc))}[/red]\n")
+                continue
+            if status_res.returncode != 0:
+                console.print(
+                    f"[red]✗ 读取 Git 状态失败: {escape(status_res.stderr.strip())}[/red]\n"
+                )
+                continue
+            status_text = status_res.stdout.strip()
+            if not status_text:
+                console.print("[yellow]当前没有代码变更可提交。[/yellow]\n")
+                continue
+
             if not msg:
                 try:
-                    diff_res = subprocess.run(
-                        ["git", "diff", "HEAD"],
-                        cwd=agent.config.workspace_root,
+                    diff_res = run_git(
+                        agent.config.workspace_root,
+                        "diff",
+                        "HEAD",
                         capture_output=True,
-                        text=True,
-                        check=False,
                     )
                     diff_text = diff_res.stdout.strip()
-                    if not diff_text:
-                        console.print("[yellow]当前没有代码变更可提交。[/yellow]\n")
-                        continue
                     gen_prompt = (
-                        "请根据以下 git diff 生成一行标准规范的 Conventional Commit 信息"
+                        "请根据以下 git 状态与 diff 生成一行标准规范的 Conventional Commit 信息"
                         "（例如 feat: ... 或 fix: ...），仅直接返回 Commit 文本本身：\n"
+                        f"```text\n{status_text[:2000]}\n```\n"
                         f"```diff\n{diff_text[:3000]}\n```"
                     )
-                    gen_msg = agent.step(gen_prompt).strip().strip("`'\"")
+                    gen_msg = agent.step(gen_prompt, tool_definitions=[]).strip().strip("`'\"")
                     if Confirm.ask(
-                        f"是否以此信息提交？\n[bold cyan]{gen_msg}[/bold cyan]",
+                        f"是否以此信息提交？\n[bold cyan]{escape(gen_msg)}[/bold cyan]",
                         default=True,
                         console=console,
                     ):
@@ -528,18 +589,77 @@ def repl_loop(agent: Agent, console: Console) -> None:
                     else:
                         continue
                 except Exception as exc:
-                    console.print(f"[red]✗ 生成提交信息失败: {exc}[/red]\n")
+                    console.print(f"[red]✗ 生成提交信息失败: {escape(str(exc))}[/red]\n")
                     continue
 
             if msg:
-                try:
-                    subprocess.run(["git", "add", "."], cwd=agent.config.workspace_root, check=True)
-                    subprocess.run(
-                        ["git", "commit", "-m", msg], cwd=agent.config.workspace_root, check=True
+                refreshed_status = run_git(
+                    agent.config.workspace_root,
+                    "status",
+                    "--short",
+                    capture_output=True,
+                )
+                if refreshed_status.returncode != 0:
+                    console.print(
+                        f"[red]✗ 读取 Git 状态失败: "
+                        f"{escape(refreshed_status.stderr.strip())}[/red]\n"
                     )
-                    console.print(f"[green]✔ Git 提交成功:[/green] [bold cyan]{msg}[/bold cyan]\n")
+                    continue
+                status_text = refreshed_status.stdout.strip()
+                if not status_text:
+                    console.print("[yellow]当前没有代码变更可提交。[/yellow]\n")
+                    continue
+                console.print("[bold cyan]即将暂存并提交以下变更：[/bold cyan]")
+                console.print(status_text, markup=False)
+                if not Confirm.ask(
+                    "是否暂存以上全部当前变更？",
+                    default=False,
+                    console=console,
+                ):
+                    console.print("[yellow]已取消 Git 提交。[/yellow]\n")
+                    continue
+                try:
+                    run_git(agent.config.workspace_root, "add", "--all", check=True)
+                    staged_diff = run_git(
+                        agent.config.workspace_root,
+                        "diff",
+                        "--cached",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        capture_output=True,
+                        check=True,
+                    )
+                    console.print("[bold cyan]已暂存、即将提交的精确 diff：[/bold cyan]")
+                    console.print(
+                        Syntax(
+                            staged_diff.stdout or "(无文本 diff)",
+                            "diff",
+                            theme="monokai",
+                            line_numbers=False,
+                        )
+                    )
+                    if not Confirm.ask(
+                        f"是否以 [bold cyan]{escape(msg)}[/bold cyan] 提交以上已暂存内容？",
+                        default=False,
+                        console=console,
+                    ):
+                        console.print(
+                            "[yellow]已取消提交；为避免破坏原有暂存状态，"
+                            "以上变更保持 staged。[/yellow]\n"
+                        )
+                        continue
+                    run_git(
+                        agent.config.workspace_root,
+                        "commit",
+                        "-m",
+                        msg,
+                        check=True,
+                    )
+                    console.print(
+                        f"[green]✔ Git 提交成功:[/green] [bold cyan]{escape(msg)}[/bold cyan]\n"
+                    )
                 except subprocess.CalledProcessError as exc:
-                    console.print(f"[red]✗ Git 提交失败: {exc}[/red]\n")
+                    console.print(f"[red]✗ Git 提交失败: {escape(str(exc))}[/red]\n")
             continue
 
         if user_input == "/sessions":
@@ -552,14 +672,18 @@ def repl_loop(agent: Agent, console: Console) -> None:
                 target_id = parts[1].strip()
                 loaded = load_session(target_id)
                 if loaded:
-                    agent.session = loaded
-                    agent.history = loaded.history
-                    console.print(
-                        f"[green]✔ 已成功恢复会话:[/green] [bold cyan]{target_id}[/bold cyan] "
-                        f"[dim]({loaded.meta.title}, {len(loaded.history)} 条记录)[/dim]\n"
-                    )
+                    try:
+                        agent.resume_session(loaded)
+                    except ValueError as exc:
+                        console.print(f"[red]✗ 无法恢复会话: {escape(str(exc))}[/red]\n")
+                    else:
+                        console.print(
+                            f"[green]✔ 已成功恢复会话:[/green] "
+                            f"[bold cyan]{escape(target_id)}[/bold cyan] "
+                            f"[dim]({loaded.meta.title}, {len(loaded.history)} 条记录)[/dim]\n"
+                        )
                 else:
-                    console.print(f"[red]✗ 未找到指定的会话 ID: '{target_id}'[/red]\n")
+                    console.print(f"[red]✗ 未找到指定的会话 ID: '{escape(target_id)}'[/red]\n")
             else:
                 console.print(
                     "[yellow]用法: /resume <Session_ID> (可通过 /sessions 查看 ID)[/yellow]\n"
@@ -567,14 +691,10 @@ def repl_loop(agent: Agent, console: Console) -> None:
             continue
 
         if user_input == "/new":
-            new_id = generate_session_id()
-            agent.__init__(
-                config=agent.config,
-                llm_client=agent.llm_client,
-                listener=agent.listener,
-            )
+            new_id = agent.reset_session()
             console.print(
-                f"[green]✔ 已重置上下文，开启全新会话:[/green] [bold cyan]{new_id}[/bold cyan]\n"
+                f"[green]✔ 已重置上下文，开启全新会话:[/green] "
+                f"[bold cyan]{escape(new_id)}[/bold cyan]\n"
             )
             continue
 
@@ -585,7 +705,8 @@ def repl_loop(agent: Agent, console: Console) -> None:
                 agent.config.model = new_model
                 agent.session.meta.model = new_model
                 console.print(
-                    f"[green]✔ 已切换当前模型为:[/green] [bold cyan]{new_model}[/bold cyan]\n"
+                    f"[green]✔ 已切换当前模型为:[/green] "
+                    f"[bold cyan]{escape(new_model)}[/bold cyan]\n"
                 )
             else:
                 console.print(
@@ -600,9 +721,9 @@ def repl_loop(agent: Agent, console: Console) -> None:
         try:
             agent.step(user_input)
         except LLMError as exc:
-            console.print(f"\n[bold red]LLM 错误[/bold red]: {exc}\n")
+            console.print(f"\n[bold red]LLM 错误[/bold red]: {escape(str(exc))}\n")
         except Exception as exc:
-            console.print(f"\n[bold red]执行错误[/bold red]: {exc}\n")
+            console.print(f"\n[bold red]执行错误[/bold red]: {escape(str(exc))}\n")
 
 
 def load_dotenv(workspace_root: Path | None = None) -> None:
@@ -618,7 +739,7 @@ def load_dotenv(workspace_root: Path | None = None) -> None:
                     key, val = stripped.split("=", 1)
                     key = key.strip()
                     val = val.strip().strip("'\"")
-                    if key and key not in os.environ:
+                    if key in DOTENV_ALLOWED_KEYS and key not in os.environ:
                         os.environ[key] = val
         except OSError:
             pass
@@ -639,10 +760,15 @@ def run_cli(
     target_workspace = (workspace or Path.cwd()).resolve()
     load_dotenv(target_workspace)
     if not target_workspace.exists():
-        console.print(f"[bold red]错误[/bold red]: 指定的工作区路径不存在: '{target_workspace}'")
+        console.print(
+            f"[bold red]错误[/bold red]: 指定的工作区路径不存在: '{escape(str(target_workspace))}'"
+        )
         raise typer.Exit(code=1)
     if not target_workspace.is_dir():
-        console.print(f"[bold red]错误[/bold red]: 指定的工作区路径不是目录: '{target_workspace}'")
+        console.print(
+            f"[bold red]错误[/bold red]: 指定的工作区路径不是目录: "
+            f"'{escape(str(target_workspace))}'"
+        )
         raise typer.Exit(code=1)
 
     effective_base_url = (
@@ -653,7 +779,7 @@ def run_cli(
     elif os.environ.get("MINI_AGENT_MODEL"):
         resolved_model = os.environ["MINI_AGENT_MODEL"]
     elif effective_base_url and "deepseek" in effective_base_url.lower():
-        resolved_model = "deepseek-v4"
+        resolved_model = "deepseek-v4-flash"
     else:
         resolved_model = "gpt-4o-mini"
 
@@ -667,7 +793,7 @@ def run_cli(
                 "  [cyan]export OPENAI_API_KEY='sk-...'[/cyan]\n"
                 "若使用 DeepSeek，可同时配置：\n"
                 "  [cyan]export OPENAI_BASE_URL='https://api.deepseek.com'[/cyan]\n"
-                "  [cyan]export MINI_AGENT_MODEL='deepseek-v4'[/cyan]"
+                "  [cyan]export MINI_AGENT_MODEL='deepseek-v4-flash'[/cyan]"
             )
             raise typer.Exit(code=1)
         client: LLMClient = OpenAIChatCompletionsClient(
@@ -688,7 +814,7 @@ def run_cli(
     if session_id:
         loaded_session = load_session(session_id)
         if not loaded_session:
-            console.print(f"[bold red]错误[/bold red]: 未找到指定的会话 ID: '{session_id}'")
+            console.print(f"[bold red]错误[/bold red]: 未找到指定的会话 ID: '{escape(session_id)}'")
             raise typer.Exit(code=1)
     elif continue_session:
         loaded_session = get_latest_session(target_workspace)
@@ -698,8 +824,20 @@ def run_cli(
                 f"({loaded_session.meta.title})[/dim]"
             )
 
+    if loaded_session is not None:
+        loaded_workspace = Path(loaded_session.meta.workspace_root).resolve()
+        if loaded_workspace != target_workspace:
+            console.print(
+                "[bold red]错误[/bold red]: 该会话属于其他工作区，已拒绝恢复。\n"
+                f"  当前: {escape(str(target_workspace))}\n"
+                f"  会话: {escape(str(loaded_workspace))}"
+            )
+            raise typer.Exit(code=1)
+
     if agent_factory is not None:
         agent = agent_factory(config, client, listener)
+        if loaded_session is not None:
+            agent.resume_session(loaded_session)
     else:
         agent = Agent(
             config=config,
@@ -713,7 +851,7 @@ def run_cli(
         try:
             agent.step(prompt)
         except Exception as exc:
-            console.print(f"[bold red]执行失败[/bold red]: {exc}")
+            console.print(f"[bold red]执行失败[/bold red]: {escape(str(exc))}")
             raise typer.Exit(code=1) from exc
         return
 
@@ -744,7 +882,7 @@ def main(
         typer.Option(
             "--model",
             "-m",
-            help="覆盖本次会话的模型名称（如 deepseek-v4 或 gpt-4o）",
+            help="覆盖本次会话的模型名称（如 deepseek-v4-flash 或 gpt-4o-mini）",
         ),
     ] = None,
     base_url: Annotated[

@@ -1,4 +1,4 @@
-"""Provider presets for mainstream LLM services (DeepSeek V4, OpenAI, Ollama, Qwen, etc.)."""
+"""Provider presets for mainstream OpenAI-compatible LLM services."""
 
 from dataclasses import dataclass
 
@@ -18,10 +18,10 @@ class ProviderPreset:
 PREDEFINED_PROVIDERS: dict[str, ProviderPreset] = {
     "deepseek": ProviderPreset(
         name="deepseek",
-        display_name="DeepSeek V4 (官方标准版)",
-        default_model="deepseek-v4",
+        display_name="DeepSeek V4 Flash (官方默认)",
+        default_model="deepseek-v4-flash",
         base_url="https://api.deepseek.com",
-        description="深度求索全新 V4 系列旗舰模型，编程与综合推理能力巅峰",
+        description="低延迟、长上下文，支持思考与非思考模式",
     ),
     "deepseek-flash": ProviderPreset(
         name="deepseek-flash",
@@ -30,19 +30,12 @@ PREDEFINED_PROVIDERS: dict[str, ProviderPreset] = {
         base_url="https://api.deepseek.com",
         description="极速低延迟轻量模型，价格极具性价比，适合代码检索与快速审查",
     ),
-    "deepseek-r1": ProviderPreset(
-        name="deepseek-r1",
-        display_name="DeepSeek V4 Reasoner (深度思考)",
-        default_model="deepseek-v4-reasoner",
+    "deepseek-pro": ProviderPreset(
+        name="deepseek-pro",
+        display_name="DeepSeek V4 Pro",
+        default_model="deepseek-v4-pro",
         base_url="https://api.deepseek.com",
-        description="深度强化学习推理模型，长链路架构设计与复杂 Bug 溯源首选",
-    ),
-    "deepseek-v3": ProviderPreset(
-        name="deepseek-v3",
-        display_name="DeepSeek V3 (经典版)",
-        default_model="deepseek-chat",
-        base_url="https://api.deepseek.com",
-        description="DeepSeek-V3 稳定对话版本",
+        description="旗舰模型，适合复杂架构设计、编码与长链路推理",
     ),
     "openai": ProviderPreset(
         name="openai",
@@ -92,10 +85,17 @@ PREDEFINED_PROVIDERS: dict[str, ProviderPreset] = {
 def get_provider_preset(name: str) -> ProviderPreset | None:
     """Lookup a provider preset by name (case-insensitive with aliases)."""
     clean_name = name.strip().lower()
-    if clean_name in ("deepseek-reasoner", "reasoner"):
-        clean_name = "deepseek-r1"
-    if clean_name in ("deepseek-chat", "v3"):
-        clean_name = "deepseek-v3"
+    if clean_name in (
+        "deepseek-r1",
+        "deepseek-reasoner",
+        "reasoner",
+        "pro",
+        "v4-pro",
+        "deepseek-v4-pro",
+    ):
+        clean_name = "deepseek-pro"
+    if clean_name in ("deepseek-chat", "deepseek-v3", "v3"):
+        clean_name = "deepseek"
     if clean_name in ("flash", "v4-flash"):
         clean_name = "deepseek-flash"
     if clean_name in ("v4", "deepseek-v4"):

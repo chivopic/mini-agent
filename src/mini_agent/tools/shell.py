@@ -44,27 +44,20 @@ BLOCKLIST_PATTERNS = [
     r"\bcat\s+.*(\/etc\/shadow|\/etc\/passwd|~?\/\.ssh|~?\/\.aws|~?\/\.netrc)",
 ]
 
-# Low-risk / read-only commands that can be automatically executed without confirmation
-ALLOWLIST_COMMANDS = {
-    "pwd",
-    "ls",
-    "dir",
-    "find",
-    "rg",
-    "grep",
-    "pytest",
-    "git status",
-    "git diff",
-    "git log",
-    "git branch",
-    "git show",
-    "python -m pytest",
-    "python --version",
-    "uv run pytest",
-    "uv run ruff",
-    "uv run python",
-    "uv --version",
+# Low-risk commands that can be executed as argv without invoking a shell.
+# Interpreters, test runners, generic `find`, and mutating Git forms are intentionally excluded:
+# validating only their executable prefix would grant arbitrary code execution without confirmation.
+AUTO_ALLOWED_COMMANDS = {"pwd", "ls"}
+AUTO_ALLOWED_EXACT = {
+    ("python", "--version"),
+    ("python3", "--version"),
+    ("uv", "--version"),
 }
+
+# Shell grammar and expansion are supported only after explicit confirmation. Auto-allowed commands
+# are deliberately conservative and use shell=False, so these strings must never be reinterpreted by
+# a shell before the permission decision is enforced.
+SHELL_SYNTAX_PATTERN = re.compile(r"[\r\n|&;<>`$(){}*?\[\]]")
 
 SENSITIVE_ENV_PREFIXES = (
     "OPENAI_",
@@ -104,6 +97,11 @@ def sanitize_environment(base_env: dict[str, str] | None = None) -> dict[str, st
         "TERM",
         "TMPDIR",
         "VIRTUAL_ENV",
+        # Windows process startup essentials (best-effort support; CI currently runs on Linux).
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
     }
 
     clean_env: dict[str, str] = {}
@@ -133,7 +131,10 @@ def check_command_safety(command: str) -> tuple[bool, bool, str | None]:
         if re.search(pattern, stripped, re.IGNORECASE):
             return True, False, f"命令包含高危模式，已被安全策略直接阻断: '{stripped}'"
 
-    # Check allowlist (exact match or matching prefix)
+    if SHELL_SYNTAX_PATTERN.search(stripped):
+        return False, True, "命令包含 Shell 组合、重定向或展开语法，需要用户确认"
+
+    # Parse a simple argv command. Complex shell strings are never auto-allowed.
     try:
         tokens = shlex.split(stripped)
     except ValueError:
@@ -143,19 +144,13 @@ def check_command_safety(command: str) -> tuple[bool, bool, str | None]:
     if not tokens:
         return True, False, "命令不能为空"
 
-    # Check against allowlist
+    normalized = tuple(tokens)
     first_token = tokens[0]
-    first_two = " ".join(tokens[:2]) if len(tokens) >= 2 else first_token
-    first_three = " ".join(tokens[:3]) if len(tokens) >= 3 else first_two
 
-    if (
-        first_token in ALLOWLIST_COMMANDS
-        or first_two in ALLOWLIST_COMMANDS
-        or first_three in ALLOWLIST_COMMANDS
-    ):
-        # Even if command base is allowlisted, check for suspicious redirection/pipe
-        if any(tok in ("|", ">", ">>", "&", "&&", ";") for tok in tokens):
-            return False, True, "命令包含管道或重定向，需要用户确认"
+    if normalized in AUTO_ALLOWED_EXACT:
+        return False, False, None
+
+    if first_token in AUTO_ALLOWED_COMMANDS:
         return False, False, None
 
     # Default for all non-allowlisted commands: require confirmation
@@ -195,16 +190,30 @@ def run_shell(
 
     process: subprocess.Popen[str] | None = None
     try:
-        # Use start_new_session to create a separate process group for clean timeout termination
+        # Auto-allowed commands are executed as argv with shell=False. Only an explicitly confirmed
+        # command may retain shell-string behavior such as pipes, globs, or redirection.
+        popen_command: str | list[str]
+        use_shell = requires_confirmation
+        if use_shell:
+            popen_command = command
+        else:
+            popen_command = shlex.split(command)
+
+        popen_kwargs: dict[str, Any] = {}
+        if os.name == "posix":
+            popen_kwargs["start_new_session"] = True
+        elif os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
         process = subprocess.Popen(
-            command,
+            popen_command,
             cwd=resolved_root,
-            shell=True,
+            shell=use_shell,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=clean_env,
-            start_new_session=True,
+            **popen_kwargs,
         )
 
         stdout_data, stderr_data = process.communicate(timeout=timeout_seconds)
@@ -212,18 +221,23 @@ def run_shell(
 
     except subprocess.TimeoutExpired:
         if process is not None:
-            # Terminate the entire process group
-            try:
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-            except OSError:
-                pass
+            if os.name == "posix":
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                except OSError:
+                    process.terminate()
+            else:
+                process.terminate()
             try:
                 stdout_data, stderr_data = process.communicate(timeout=2)
             except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                except OSError:
-                    pass
+                if os.name == "posix":
+                    try:
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    except OSError:
+                        process.kill()
+                else:
+                    process.kill()
                 stdout_data, stderr_data = "", ""
 
         return ToolResult(

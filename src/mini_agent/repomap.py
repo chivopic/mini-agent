@@ -139,9 +139,13 @@ def extract_file_symbols(file_path: Path) -> list[str]:
 def generate_repo_map(
     workspace_root: Path,
     max_tokens: int = 1500,
+    boundary_root: Path | None = None,
 ) -> str:
-    """Generate condensed Repo Map of the entire workspace."""
+    """Generate a condensed Repo Map without following files outside the allowed boundary."""
     resolved_root = workspace_root.resolve()
+    resolved_boundary = (boundary_root or resolved_root).resolve()
+    if resolved_root != resolved_boundary and not resolved_root.is_relative_to(resolved_boundary):
+        return ""
     lines: list[str] = []
 
     code_files: list[Path] = []
@@ -151,6 +155,14 @@ def generate_repo_map(
             if f in IGNORED_DIRS:
                 continue
             fp = Path(root) / f
+            try:
+                resolved_fp = fp.resolve()
+            except OSError:
+                continue
+            if resolved_fp != resolved_boundary and not resolved_fp.is_relative_to(
+                resolved_boundary
+            ):
+                continue
             if fp.suffix.lower() in (
                 ".py",
                 ".js",
@@ -160,7 +172,7 @@ def generate_repo_map(
                 ".rs",
                 ".go",
             ):
-                code_files.append(fp)
+                code_files.append(resolved_fp)
 
     for fp in code_files:
         try:

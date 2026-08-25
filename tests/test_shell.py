@@ -1,5 +1,6 @@
 """Unit tests for controlled shell tool and security policies."""
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -38,9 +39,8 @@ class TestCommandSafetyPolicy:
         safe_cmds = [
             "pwd",
             "ls",
-            "git status",
-            "git diff",
-            "uv run pytest",
+            "python --version",
+            "uv --version",
         ]
         for cmd in safe_cmds:
             is_blocked, req_conf, reason = check_command_safety(cmd)
@@ -52,11 +52,37 @@ class TestCommandSafetyPolicy:
             "npm run build",
             "cargo test",
             "python script.py",
+            "rg mini-agent README.md",
+            "grep mini-agent README.md",
+            "git status",
+            "git status --short --branch",
+            "git branch --show-current",
+            "pytest",
+            "uv run pytest",
+            "uv run python -c \"print('unsafe')\"",
+            "find . -delete",
+            "git branch -D main",
+            "rg --pre 'python helper.py' pattern .",
+            "rg --hostname-bin hostname-helper pattern .",
         ]
         for cmd in unlisted_cmds:
             is_blocked, req_conf, reason = check_command_safety(cmd)
             assert is_blocked is False
             assert req_conf is True, f"Command should require confirmation: {cmd}"
+            assert reason is not None
+
+    def test_shell_syntax_always_requires_confirmation(self) -> None:
+        shell_commands = [
+            "ls $(touch injected)",
+            "ls `touch injected`",
+            "ls\ntouch injected",
+            "ls > listing.txt",
+            "ls *.py",
+        ]
+        for cmd in shell_commands:
+            is_blocked, req_conf, reason = check_command_safety(cmd)
+            assert is_blocked is False
+            assert req_conf is True, f"Shell syntax must require confirmation: {cmd}"
             assert reason is not None
 
 
@@ -162,6 +188,47 @@ class TestShellExecution:
         assert result.ok is False
         assert result.metadata.get("requires_confirmation") is True
         assert not (tmp_path / "test_file.txt").exists()
+
+    def test_allowlist_shell_injection_rejected_before_execution(self, tmp_path: Path) -> None:
+        result = run_shell(
+            RunShellInput(command="ls $(touch injected.txt)"),
+            workspace_root=tmp_path,
+            confirmed=False,
+        )
+        assert result.ok is False
+        assert result.metadata.get("requires_confirmation") is True
+        assert not (tmp_path / "injected.txt").exists()
+
+    def test_git_status_fsmonitor_requires_confirmation(self, tmp_path: Path) -> None:
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        marker = tmp_path / "fsmonitor-ran"
+        hook = tmp_path / "fsmonitor-hook"
+        hook.write_text(f"#!/bin/sh\ntouch '{marker}'\nprintf '\\0'\n", encoding="utf-8")
+        hook.chmod(0o700)
+        subprocess.run(
+            ["git", "config", "core.fsmonitor", hook.as_posix()],
+            cwd=tmp_path,
+            check=True,
+        )
+
+        result = run_shell(
+            RunShellInput(command="git status"),
+            workspace_root=tmp_path,
+            confirmed=False,
+        )
+
+        assert result.ok is False
+        assert result.metadata.get("requires_confirmation") is True
+        assert not marker.exists()
+
+    def test_confirmed_shell_pipeline_still_supported(self, tmp_path: Path) -> None:
+        result = run_shell(
+            RunShellInput(command="printf hello | tr a-z A-Z"),
+            workspace_root=tmp_path,
+            confirmed=True,
+        )
+        assert result.ok is True
+        assert result.content == "HELLO"
 
     def test_blocked_command_not_executed(self, tmp_path: Path) -> None:
         cmd = "rm -rf /"
