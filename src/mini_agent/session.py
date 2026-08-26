@@ -31,6 +31,7 @@ class SessionMeta(BaseModel):
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
     total_cost_cny: float = 0.0
+    compacted_at: str | None = None
 
 
 class SessionData(BaseModel):

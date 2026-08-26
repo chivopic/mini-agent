@@ -14,7 +14,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from mini_agent.context import compact_history
+from mini_agent.compaction import CompactionConfig, compact_for_model
 from mini_agent.cost import UsageStats, calculate_cost_cny
 from mini_agent.events import (
     AgentEventListener,
@@ -42,8 +42,6 @@ from mini_agent.messages import (
     TextPart,
     ToolCallPart,
     ToolResultPart,
-    history_v1_to_messages,
-    messages_to_v1_history,
 )
 from mini_agent.models import AgentConfig, PermissionClass, ToolResult
 from mini_agent.permission import (
@@ -113,11 +111,13 @@ class Agent:
         registry: ToolRegistry | None = None,
         permission: PermissionService | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        compaction_config: CompactionConfig | None = None,
     ) -> None:
         self.config = config
         self.llm_client = llm_client
         self.listener: AgentEventListener = listener or NoopListener()
         self.registry = registry or default_registry()
+        self.compaction_config = compaction_config or CompactionConfig()
         self._cancel = threading.Event()
         self._monotonic = monotonic
         self._last_sigint_at: float | None = None
@@ -360,9 +360,20 @@ class Agent:
             UsageReported(usage=turn_usage, cost_cny=cost, model=self.config.model)
         )
 
-    def _compact_window(self) -> list[Message]:
-        v1 = compact_history(messages_to_v1_history(self.messages))
-        return history_v1_to_messages(v1, created_at=self.session.meta.created_at)
+    def _compact_window(self, tool_schemas: list[dict[str, Any]]) -> list[Message]:
+        window, notice = compact_for_model(
+            self.messages,
+            self.compaction_config,
+            tool_schemas,
+            self.llm_client,
+            self.config.model,
+            cancel=self._cancel,
+        )
+        if notice is not None:
+            self.listener.on_event(notice)
+            if notice.summary:
+                self.session.meta.compacted_at = datetime.now().isoformat()
+        return window
 
     def _reset_doom(self) -> None:
         self._doom_key = None
@@ -640,7 +651,7 @@ class Agent:
                     return self._end_finished(cleaned_input, turn_usage, _DOOM_MSG)
 
                 self.listener.on_event(ModelStarted())
-                window = self._compact_window()
+                window = self._compact_window(turn_tools)
                 response = self._create_response(window, turn_tools)
                 if response is None or self._cancel.is_set():
                     text = response.text if response is not None else None
