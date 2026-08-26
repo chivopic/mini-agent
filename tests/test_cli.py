@@ -12,6 +12,7 @@ import typer
 from rich.console import Console
 from typer.testing import CliRunner
 
+from mini_agent import __version__
 from mini_agent.agent import Agent
 from mini_agent.cli import (
     RichAgentEventListener,
@@ -25,7 +26,9 @@ from mini_agent.llm import FunctionCall, LLMClient, LLMResponse
 from mini_agent.messages import Message
 from mini_agent.models import AgentConfig, ToolResult
 from mini_agent.permission import DefaultPermissionService, Reply
+from mini_agent.render import format_tool_call
 from mini_agent.session import SessionData, SessionMeta, save_session
+from mini_agent.tools import default_registry
 
 runner = CliRunner()
 
@@ -87,6 +90,8 @@ class TestCliCommands:
         assert "/sessions" in out
         assert "/resume" in out
         assert "/new" in out
+        assert "/cancel" in out
+        assert "/config" in out
         assert "list_files" in out
         assert "read_file" in out
         assert "run_shell" in out
@@ -98,6 +103,7 @@ class TestCliCommands:
         render_banner(test_console, tmp_path, "deepseek-chat", session_id="test_sess_123")
         out = test_console.export_text()
         assert "MINI-AGENT" in out
+        assert f"v{__version__}" in out
         assert "deepseek-chat" in out
         assert "test_sess_123" in out
 
@@ -195,6 +201,8 @@ class TestCliReplExecution:
                 model="gpt-4o-mini",
                 title="新会话",
                 turn_count=1,
+                total_prompt_tokens=100,
+                total_completion_tokens=20,
             ),
             permission_memory=[{"cls": "shell", "pattern": "uv run pytest*", "effect": "allow"}],
         )
@@ -222,6 +230,34 @@ class TestCliReplExecution:
         assert agent.session.meta.session_id == "s_new"
         patterns = {entry["pattern"] for entry in agent.permission.snapshot()}
         assert patterns == {"uv run pytest*"}
+        assert agent.session_usage.prompt_tokens == 100
+        assert agent.session_usage.completion_tokens == 20
+        assert agent.session_usage.total_tokens == 120
+
+    def test_repl_new_id_matches_session_meta(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        captured: dict[str, Agent] = {}
+
+        def factory(config: AgentConfig, client: LLMClient, listener: object) -> Agent:
+            agent = Agent(
+                config=config,
+                llm_client=client,
+                listener=listener,  # type: ignore[arg-type]
+            )
+            captured["agent"] = agent
+            return agent
+
+        with patch("rich.prompt.Prompt.ask", side_effect=["/new", "/exit"]):
+            run_cli(
+                workspace=tmp_path,
+                llm_client=DummyLLM("ok"),
+                agent_factory=factory,
+            )
+
+        agent = captured["agent"]
+        out = capsys.readouterr().out
+        assert agent.session.meta.session_id in out
 
     def test_repl_sessions_and_new_commands(self, tmp_path: Path) -> None:
         dummy_llm = DummyLLM("test answer")
@@ -346,6 +382,32 @@ class TestCliReplExecution:
                 )
                 assert result.exit_code == 0
 
+    def test_repl_config_redacts_api_key(self, tmp_path: Path) -> None:
+        dummy_llm = DummyLLM("test answer")
+        with patch("mini_agent.cli.OpenAIChatCompletionsClient", return_value=dummy_llm):
+            with patch.dict("os.environ", {"OPENAI_API_KEY": "sk-secret-value"}):
+                result = runner.invoke(
+                    app,
+                    ["--workspace", str(tmp_path)],
+                    input="/config\n/exit\n",
+                )
+        assert result.exit_code == 0
+        assert "sk-secret-value" not in result.stdout
+        assert "********" in result.stdout
+
+    def test_repl_cancel_command(self, tmp_path: Path) -> None:
+        dummy_llm = DummyLLM("test answer")
+        with patch("mini_agent.cli.OpenAIChatCompletionsClient", return_value=dummy_llm):
+            with patch.dict("os.environ", {"OPENAI_API_KEY": "fake-key"}):
+                result = runner.invoke(
+                    app,
+                    ["--workspace", str(tmp_path)],
+                    input="/cancel\n/exit\n",
+                )
+        assert result.exit_code == 0
+        assert "当前没有正在执行的回合" in result.stdout
+        assert "Ctrl-C" in result.stdout
+
     def test_repl_cost_command(self, tmp_path: Path) -> None:
         dummy_llm = DummyLLM("test answer")
         with patch("mini_agent.cli.OpenAIChatCompletionsClient", return_value=dummy_llm):
@@ -376,6 +438,7 @@ class TestCliReplExecution:
         listener.on_turn_start("hello")
         listener.on_token("你")
         listener.on_token("好")
+        listener.registry = default_registry()
         listener.on_tool_start("read_file", {"path": "main.py"})
         listener.on_tool_finished(
             "read_file", ToolResult(ok=True, content="code", metadata={"size_bytes": 100})
@@ -386,8 +449,20 @@ class TestCliReplExecution:
         out = test_console.export_text()
         assert "你好" in out
         assert "read_file" in out
+        assert "read_file path=main.py" in out
         assert "成功" in out
         assert "失败" in out
+
+    def test_unknown_tool_uses_generic_format_call(self) -> None:
+        test_console = Console(record=True)
+        listener = RichAgentEventListener(console=test_console, verbose=True)
+        listener.on_tool_start("mystery_tool", {"foo": "bar", "n": 1})
+        out = test_console.export_text()
+        assert "mystery_tool" in out
+        assert "foo" in out
+        assert format_tool_call("mystery_tool", {"foo": "bar", "n": 1}) == (
+            "mystery_tool foo='bar', n=1"
+        )
 
     def test_run_cli_with_injected_client(self, tmp_path: Path) -> None:
         dummy_llm = DummyLLM("你好，这是测试！")
