@@ -89,6 +89,23 @@ PREDEFINED_PROVIDERS: dict[str, ProviderPreset] = {
 }
 
 
+def expand_provider_preset(
+    name: str | None,
+    *,
+    model: str | None = None,
+    base_url: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Expand a named preset. Explicit model / base_url override preset defaults."""
+    if not name or not str(name).strip():
+        return model, base_url
+    preset = get_provider_preset(str(name))
+    if preset is None:
+        raise ValueError(f"未知服务商预设: '{name}'")
+    resolved_model = model if model else preset.default_model
+    resolved_base_url = base_url if base_url else preset.base_url
+    return resolved_model, resolved_base_url
+
+
 def get_provider_preset(name: str) -> ProviderPreset | None:
     """Lookup a provider preset by name (case-insensitive with aliases)."""
     clean_name = name.strip().lower()
