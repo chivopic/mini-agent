@@ -28,14 +28,14 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Show Ruff auto-fix diff
-        run: uv run ruff check . --fix --diff
-
       - name: Set up Python
         run: uv python install 3.12
 
       - name: Install dependencies
         run: uv sync --all-groups --locked
+
+      - name: Lint with Ruff
+        run: uv run ruff check .
 
       - name: Check Formatting with Ruff
         run: uv run ruff format --check .
