@@ -1,9 +1,9 @@
 """Data models and configuration contracts for mini-agent."""
 
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
-
 
 DEEPSEEK_MODEL_ALIASES = {
     "deepseek-v4": "deepseek-v4-flash",
@@ -44,9 +44,8 @@ class AgentConfig(BaseModel):
 
     @field_validator("workspace_root", mode="before")
     @classmethod
-    def validate_and_resolve_workspace_root(cls, value: object) -> Path:
-        path = Path(value)  # type: ignore[arg-type]
-        path = path.resolve()
+    def validate_and_resolve_workspace_root(cls, value: Any) -> Path:
+        path = Path(value).resolve()
         if not path.exists():
             raise ValueError(f"Workspace path does not exist: {path}")
         if not path.is_dir():
@@ -55,7 +54,7 @@ class AgentConfig(BaseModel):
 
     @field_validator("model", mode="before")
     @classmethod
-    def canonicalize_model_alias(cls, value: object) -> object:
+    def canonicalize_model_alias(cls, value: Any) -> Any:
         """Map retired DeepSeek model IDs to currently supported V4 API IDs."""
         if not isinstance(value, str):
             return value
@@ -75,7 +74,7 @@ class ToolResult(BaseModel):
         default=None,
         description="Human-readable and LLM-readable error message when ok=False.",
     )
-    metadata: dict[str, object] = Field(
+    metadata: dict[str, Any] = Field(
         default_factory=dict,
         description="Structured metadata such as truncated flags, status codes, paths, etc.",
     )
