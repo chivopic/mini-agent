@@ -25,7 +25,13 @@ from mini_agent.session import (
     generate_session_id,
     save_session,
 )
-from mini_agent.tools.filesystem import edit_file, list_files, read_file, search_code, write_file
+from mini_agent.tools.secure_filesystem import (
+    edit_file,
+    list_files,
+    read_file,
+    search_code,
+    write_file,
+)
 from mini_agent.tools.shell import check_command_safety, run_shell
 
 
