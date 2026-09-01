@@ -12,7 +12,7 @@ from mini_agent.tools.shell import (
 
 
 class TestCommandSafetyPolicy:
-    """Test blocklist, allowlist, and confirmation safety decisions."""
+    """Test blocklist, auto-allowlist, and confirmation safety decisions."""
 
     def test_blocklist_dangerous_commands(self) -> None:
         dangerous_cmds = [
@@ -34,30 +34,54 @@ class TestCommandSafetyPolicy:
             assert req_conf is False
             assert reason is not None
 
-    def test_allowlist_safe_commands(self) -> None:
-        safe_cmds = [
-            "pwd",
-            "ls",
-            "git status",
-            "git diff",
-            "uv run pytest",
-        ]
+    def test_only_simple_read_only_commands_are_auto_allowed(self) -> None:
+        safe_cmds = ["pwd", "ls", "ls -la", "python --version", "uv --version"]
         for cmd in safe_cmds:
             is_blocked, req_conf, reason = check_command_safety(cmd)
             assert is_blocked is False, f"Command should not be blocked: {cmd}"
             assert req_conf is False, f"Command should be auto-allowed: {cmd}"
+            assert reason is None
 
-    def test_non_allowlisted_commands_require_confirmation(self) -> None:
-        unlisted_cmds = [
-            "npm run build",
-            "cargo test",
+    def test_code_execution_capable_commands_require_confirmation(self) -> None:
+        commands = [
+            "git status",
+            "git diff",
+            "find . -type f",
+            "pytest",
+            "uv run pytest",
+            "uv run python -c 'print(1)'",
             "python script.py",
+            "npm run build",
         ]
-        for cmd in unlisted_cmds:
+        for cmd in commands:
             is_blocked, req_conf, reason = check_command_safety(cmd)
             assert is_blocked is False
             assert req_conf is True, f"Command should require confirmation: {cmd}"
             assert reason is not None
+
+    def test_shell_expansion_and_composition_require_confirmation(self) -> None:
+        bypass_attempts = [
+            "ls\nwhoami",
+            "ls $(touch pwned)",
+            "ls `touch pwned`",
+            "ls | cat",
+            "ls > output.txt",
+            "ls && whoami",
+            "ls; whoami",
+            "ls *.py",
+        ]
+        for cmd in bypass_attempts:
+            is_blocked, req_conf, reason = check_command_safety(cmd)
+            assert is_blocked is False
+            assert req_conf is True, f"Shell syntax must require confirmation: {cmd!r}"
+            assert reason is not None
+
+    def test_find_exec_requires_confirmation(self) -> None:
+        cmd = "find . -exec sh -c 'touch pwned' \\;"
+        is_blocked, req_conf, reason = check_command_safety(cmd)
+        assert is_blocked is False
+        assert req_conf is True
+        assert reason is not None
 
 
 class TestEnvironmentSanitization:
@@ -162,6 +186,17 @@ class TestShellExecution:
         assert result.ok is False
         assert result.metadata.get("requires_confirmation") is True
         assert not (tmp_path / "test_file.txt").exists()
+
+    def test_shell_bypass_not_executed_without_confirmation(self, tmp_path: Path) -> None:
+        cmd = "ls $(touch pwned.txt)"
+        result = run_shell(
+            RunShellInput(command=cmd),
+            workspace_root=tmp_path,
+            confirmed=False,
+        )
+        assert result.ok is False
+        assert result.metadata.get("requires_confirmation") is True
+        assert not (tmp_path / "pwned.txt").exists()
 
     def test_blocked_command_not_executed(self, tmp_path: Path) -> None:
         cmd = "rm -rf /"

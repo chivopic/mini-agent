@@ -3,12 +3,15 @@
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 from mini_agent.session import (
     SessionData,
     SessionMeta,
     delete_session,
     generate_session_id,
     get_latest_session,
+    is_valid_session_id,
     list_sessions,
     load_session,
     save_session,
@@ -20,6 +23,30 @@ def test_generate_session_id() -> None:
     sid2 = generate_session_id()
     assert len(sid1) > 10
     assert sid1 != sid2
+    assert is_valid_session_id(sid1)
+
+
+def test_reject_invalid_session_ids(tmp_path: Path) -> None:
+    invalid_ids = ["../escape", "..\\escape", "/absolute", "", "a/b", "a\\b"]
+    for sid in invalid_ids:
+        assert is_valid_session_id(sid) is False
+        assert load_session(sid, sessions_dir=tmp_path) is None
+        assert delete_session(sid, sessions_dir=tmp_path) is False
+
+
+def test_save_rejects_traversal_session_id(tmp_path: Path) -> None:
+    session = SessionData(
+        meta=SessionMeta(
+            session_id="../escape",
+            workspace_root=tmp_path.as_posix(),
+            created_at=datetime.now().isoformat(),
+            updated_at=datetime.now().isoformat(),
+            model="deepseek-v4-flash",
+        )
+    )
+    with pytest.raises(ValueError, match="非法会话 ID"):
+        save_session(session, sessions_dir=tmp_path)
+    assert not (tmp_path.parent / "escape.json").exists()
 
 
 def test_save_and_load_session(tmp_path: Path) -> None:
@@ -29,7 +56,7 @@ def test_save_and_load_session(tmp_path: Path) -> None:
         workspace_root=tmp_path.as_posix(),
         created_at=datetime.now().isoformat(),
         updated_at=datetime.now().isoformat(),
-        model="deepseek-chat",
+        model="deepseek-v4-flash",
         title="测试会话",
         turn_count=2,
     )
@@ -51,6 +78,15 @@ def test_save_and_load_session(tmp_path: Path) -> None:
     assert len(loaded.history) == 3
 
 
+def test_load_rejects_mismatched_embedded_session_id(tmp_path: Path) -> None:
+    sid = "expected"
+    (tmp_path / f"{sid}.json").write_text(
+        '{"meta":{"session_id":"other","workspace_root":"/tmp","created_at":"x","updated_at":"x","model":"m"},"history":[]}',
+        encoding="utf-8",
+    )
+    assert load_session(sid, sessions_dir=tmp_path) is None
+
+
 def test_load_non_existent_session(tmp_path: Path) -> None:
     loaded = load_session("non_existent_id", sessions_dir=tmp_path)
     assert loaded is None
@@ -61,10 +97,8 @@ def test_list_sessions_and_filter(tmp_path: Path) -> None:
     ws2 = tmp_path / "ws2"
     ws1.mkdir()
     ws2.mkdir()
-
     sessions_dir = tmp_path / "sessions"
 
-    # Create session 1 for ws1
     s1 = SessionData(
         meta=SessionMeta(
             session_id="s1",
@@ -78,31 +112,27 @@ def test_list_sessions_and_filter(tmp_path: Path) -> None:
     )
     save_session(s1, sessions_dir=sessions_dir)
 
-    # Create session 2 for ws2
     s2 = SessionData(
         meta=SessionMeta(
             session_id="s2",
             workspace_root=ws2.resolve().as_posix(),
             created_at="2026-08-18T11:00:00",
             updated_at="2026-08-18T11:00:00",
-            model="deepseek-chat",
+            model="deepseek-v4-flash",
             title="会话 2",
             turn_count=3,
         )
     )
     save_session(s2, sessions_dir=sessions_dir)
 
-    # List all
     all_sessions = list_sessions(sessions_dir=sessions_dir)
     assert len(all_sessions) == 2
-    assert all_sessions[0].session_id == "s2"  # updated later
+    assert all_sessions[0].session_id == "s2"
 
-    # Filter ws1
     ws1_sessions = list_sessions(workspace_root=ws1, sessions_dir=sessions_dir)
     assert len(ws1_sessions) == 1
     assert ws1_sessions[0].session_id == "s1"
 
-    # Filter ws2
     ws2_sessions = list_sessions(workspace_root=ws2, sessions_dir=sessions_dir)
     assert len(ws2_sessions) == 1
     assert ws2_sessions[0].session_id == "s2"

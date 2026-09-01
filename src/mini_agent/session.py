@@ -2,12 +2,16 @@
 
 import json
 import os
+import re
+import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
 
 class SessionMeta(BaseModel):
@@ -37,9 +41,17 @@ def get_default_sessions_dir() -> Path:
     custom_dir = os.environ.get("MINI_AGENT_SESSIONS_DIR")
     if custom_dir:
         path = Path(custom_dir).resolve()
-    else:
-        path = Path.home() / ".mini-agent" / "sessions"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    home_dir = Path.home() / ".mini-agent"
+    home_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name == "posix":
+        os.chmod(home_dir, 0o700)
+    path = home_dir / "sessions"
     path.mkdir(parents=True, exist_ok=True)
+    if os.name == "posix":
+        os.chmod(path, 0o700)
     return path
 
 
@@ -50,35 +62,78 @@ def generate_session_id() -> str:
     return f"{timestamp}_{random_suffix}"
 
 
+def is_valid_session_id(session_id: str) -> bool:
+    """Return whether a session ID is safe to use as a single filename stem."""
+    return bool(SESSION_ID_PATTERN.fullmatch(session_id))
+
+
+def _resolve_session_file(target_dir: Path, session_id: str) -> Path | None:
+    """Resolve a session path without allowing traversal or symlink escape."""
+    if not is_valid_session_id(session_id):
+        return None
+
+    resolved_dir = target_dir.resolve()
+    candidate = resolved_dir / f"{session_id}.json"
+    try:
+        resolved_candidate = candidate.resolve()
+    except OSError:
+        return None
+    if resolved_candidate.parent != resolved_dir:
+        return None
+    return candidate
+
+
 def save_session(session: SessionData, sessions_dir: Path | None = None) -> Path:
-    """Save session data to a JSON file atomically."""
+    """Save session data atomically."""
     target_dir = sessions_dir or get_default_sessions_dir()
     target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = target_dir.resolve()
 
-    file_path = target_dir / f"{session.meta.session_id}.json"
-    temp_path = target_dir / f"{session.meta.session_id}.tmp"
+    file_path = _resolve_session_file(target_dir, session.meta.session_id)
+    if file_path is None:
+        raise ValueError(f"非法会话 ID: '{session.meta.session_id}'")
 
     session.meta.updated_at = datetime.now().isoformat()
     json_str = session.model_dump_json(indent=2)
 
-    with open(temp_path, mode="w", encoding="utf-8") as f:
-        f.write(json_str)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target_dir,
+            prefix=f".{session.meta.session_id}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            f.write(json_str)
+            f.flush()
+            os.fsync(f.fileno())
+            temp_path = Path(f.name)
+        temp_path.replace(file_path)
+        if os.name == "posix":
+            os.chmod(file_path, 0o600)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
 
-    temp_path.replace(file_path)
     return file_path
 
 
 def load_session(session_id: str, sessions_dir: Path | None = None) -> SessionData | None:
     """Load a session by its ID."""
     target_dir = sessions_dir or get_default_sessions_dir()
-    file_path = target_dir / f"{session_id}.json"
-    if not file_path.is_file():
+    file_path = _resolve_session_file(target_dir, session_id)
+    if file_path is None or not file_path.is_file():
         return None
 
     try:
         with open(file_path, encoding="utf-8") as f:
             data = json.load(f)
-        return SessionData.model_validate(data)
+        session = SessionData.model_validate(data)
+        if session.meta.session_id != session_id:
+            return None
+        return session
     except (json.JSONDecodeError, ValueError, OSError):
         return None
 
@@ -96,15 +151,12 @@ def list_sessions(
     resolved_ws = workspace_root.resolve().as_posix() if workspace_root else None
 
     for file_path in target_dir.glob("*.json"):
-        try:
-            with open(file_path, encoding="utf-8") as f:
-                data = json.load(f)
-            meta_dict = data.get("meta", {})
-            meta = SessionMeta.model_validate(meta_dict)
-            if resolved_ws is None or meta.workspace_root == resolved_ws:
-                sessions.append(meta)
-        except Exception:
+        loaded = load_session(file_path.stem, sessions_dir=target_dir)
+        if loaded is None:
             continue
+        meta = loaded.meta
+        if resolved_ws is None or meta.workspace_root == resolved_ws:
+            sessions.append(meta)
 
     sessions.sort(key=lambda s: s.updated_at, reverse=True)
     return sessions
@@ -125,7 +177,9 @@ def get_latest_session(
 def delete_session(session_id: str, sessions_dir: Path | None = None) -> bool:
     """Delete a session file by its ID."""
     target_dir = sessions_dir or get_default_sessions_dir()
-    file_path = target_dir / f"{session_id}.json"
+    file_path = _resolve_session_file(target_dir, session_id)
+    if file_path is None:
+        return False
     if file_path.is_file():
         try:
             file_path.unlink()

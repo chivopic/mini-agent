@@ -1,235 +1,242 @@
 # mini-agent
 
-> 一个轻量级、安全受控的本地终端 AI 编程助手 CLI（MVP）。
+> 一个轻量级、受控的本地终端 AI 编程助手 CLI。
 
-`mini-agent` 运行在指定的本地工作区目录，能够理解项目结构、安全读取文件并执行受控的 Shell 命令，帮助开发者快速探索项目、定位入口代码并运行测试。
+`mini-agent` 在指定工作区内运行，支持项目结构探索、代码检索、文件读写与编辑、受控 Shell 执行、会话恢复和 Token / 成本统计。项目使用 OpenAI-compatible API，可连接 DeepSeek、OpenAI、Ollama、Qwen 等服务。
 
-**原生支持 OpenAI（GPT-4o / GPT-4o-mini）以及 DeepSeek（DeepSeek-V3 / DeepSeek-R1）和各类兼容接口。**
+> `mini-agent` 不是容器或虚拟机级安全沙箱。它会在你的本机工作区执行工具操作，因此仍应只在你信任的项目和机器上运行。
 
----
+## 功能
 
-## 目录
-
-- [功能特性与非目标](#功能特性与非目标)
-- [环境要求](#环境要求)
-- [快速开始](#快速开始)
-- [使用 DeepSeek 模型](#使用-deepseek-模型)
-- [命令行参数与使用示例](#命令行参数与使用示例)
-- [Agent 内置工具与限制](#agent-内置工具与限制)
-- [安全声明与隐私策略](#安全声明与隐私策略)
-- [自动化测试与代码质量](#自动化测试与代码质量)
-- [项目代码结构](#项目代码结构)
-- [已知限制与未来演进](#已知限制与未来演进)
-
----
-
-## 功能特性与非目标
-
-### ✅ MVP 支持的功能
-- **多模型服务商兼容**：全面兼容 **DeepSeek**（`deepseek-chat` / `deepseek-reasoner`）、**OpenAI**、**Ollama 本地模型**及任何兼容 OpenAI 标准的服务商。
-- **项目结构感知**：通过 `list_files` 快速遍历并展示工作区目录树。
-- **安全文件读取**：通过 `read_file` 安全读取 UTF-8 文本文件内容。
-- **受控 Shell 执行**：通过 `run_shell` 执行只读/低风险命令；高危操作自动拦截，其余操作需用户在终端敲击 `[y/N]` 显式确认。
-- **环境敏感变量剥离**：向子进程透传时彻底清洗 `OPENAI_API_KEY`、云厂商凭据与各类敏感 Token。
-- **现代化交互终端**：基于 Typer 与 Rich 构建，支持 Markdown 最终渲染、状态加载指示、`/help` 帮助与 `/exit` 退出。
-- **100% 离线单元测试**：基于 `LLMClient` 协议和 FakeLLM 驱动，零 API 费用、离线秒级跑通全部测试。
-
-### ❌ MVP 非目标（当前不做）
-- 不支持写文件、代码编辑、补丁应用或 Git 提交。
-- 不支持多 Agent 协作、MCP 协议、网页浏览器工具。
-- 不包含容器级 OS 沙箱；`run_shell` 直接运行在宿主机的当前工作区。
-- 不展示大模型内部思维链，仅展示工具调用与最终回答。
-
----
+- `search_code`：递归搜索工作区代码，支持普通文本和正则表达式。
+- `list_files`：查看有限深度的项目目录结构。
+- `read_file`：读取工作区内 UTF-8 文本文件。
+- `write_file`：创建或覆盖文本文件，使用临时文件 + `fsync` + 原子替换降低中断导致的文件损坏风险。
+- `edit_file`：只在目标片段唯一匹配时进行局部替换，并使用原子写入。
+- `run_shell`：执行受控 Shell 命令；高危命令直接阻断，其余非自动放行命令需要用户确认。
+- 多轮 Agent Loop、Token 流式输出、历史会话保存与恢复。
+- `/provider`、`/model`、`/cost`、`/diff`、`/commit` 等 REPL 指令。
+- Linux、macOS、Windows 三平台 CI。
 
 ## 环境要求
 
-- **操作系统**：macOS / Linux / Windows
-- **Python**：`>= 3.12`
-- **包管理器**：`uv` (推荐)
-- **API 凭据**：OpenAI API Key 或 DeepSeek API Key
+- Python `>= 3.12`
+- 推荐使用 `uv`
+- 使用远程模型时，需要对应服务商的 API Key
 
----
+## 从源码运行
 
-## 快速开始
-
-### 方式一：一行命令免安装直接运行 (uvx / pipx)
-无需手动克隆代码或配置环境：
 ```bash
-# 使用 uvx 运行
-uvx chiv-mini-agent
+git clone https://github.com/chivopic/mini-agent.git
+cd mini-agent
+uv sync --all-groups --locked
+uv run mini-agent
+```
 
-# 或者全局安装到系统
+也可以从 PyPI 安装：
+
+```bash
+uvx chiv-mini-agent
+# 或
 uv tool install chiv-mini-agent
 ```
 
-### 方式二：从源码克隆运行
-```bash
-git clone https://github.com/chenzh659/mini-agent.git
-cd mini-agent
-uv sync --all-groups
-```
+注意：`uvx` / `uv tool install` 获取的是 PyPI 上已经发布的版本，可能晚于 GitHub 仓库当前源码。
 
-### 2. 配置 API Key
+## 配置模型
 
-#### 方案 A：使用 OpenAI 官方 API
-```bash
-export OPENAI_API_KEY="sk-your-openai-key"
-uv run mini-agent
-```
+### DeepSeek
 
-#### 方案 B：使用 DeepSeek 官方 API（推荐，高性价比）
+当前 DeepSeek V4 预设使用：
+
+- `deepseek-v4-flash`：默认低延迟模型
+- `deepseek-v4-pro`：复杂编码与推理任务
+
 ```bash
-export OPENAI_API_KEY="sk-your-deepseek-key"
+export OPENAI_API_KEY="your-deepseek-api-key"
 export OPENAI_BASE_URL="https://api.deepseek.com"
-export MINI_AGENT_MODEL="deepseek-chat"
+export MINI_AGENT_MODEL="deepseek-v4-flash"
 
 uv run mini-agent
 ```
 
----
-
-## 使用 DeepSeek 模型
-
-`mini-agent` 针对 DeepSeek 进行了专门优化适配：
+也可以直接通过 CLI：
 
 ```bash
-# 启动时直接指定 DeepSeek base-url 和模型
-uv run mini-agent --base-url https://api.deepseek.com --model deepseek-chat
+uv run mini-agent \
+  --base-url https://api.deepseek.com \
+  --model deepseek-v4-flash
 ```
 
-也可以在 `.env` 文件中配置：
+旧的 `deepseek-chat`、`deepseek-v3`、`deepseek-v4` 会兼容映射到 `deepseek-v4-flash`；旧的 `deepseek-reasoner`、`deepseek-r1`、`deepseek-v4-reasoner` 会映射到 `deepseek-v4-pro`。
+
+### OpenAI
+
 ```bash
-OPENAI_API_KEY=sk-你的DeepSeekKey
-OPENAI_BASE_URL=https://api.deepseek.com
-MINI_AGENT_MODEL=deepseek-chat
+export OPENAI_API_KEY="your-openai-api-key"
+uv run mini-agent --model gpt-4o-mini
 ```
 
----
+### Ollama
 
-## 命令行参数与使用示例
+使用 `/provider ollama` 或配置兼容 OpenAI API 的本地地址即可。Ollama 本地模型不会产生远程 API 费用。
 
-### 参数说明
+## CLI 参数
 
 ```text
-用法: mini-agent [选项]
+mini-agent [OPTIONS]
 
-选项:
-  -w, --workspace PATH   指定目标工作区根目录（缺省为当前终端工作目录）
-  -p, --prompt TEXT      单次非交互执行模式：执行指定任务后退出
-  -m, --model MODEL      覆盖本次会话的模型名称（如 deepseek-chat 或 gpt-4o）
-  -b, --base-url URL     自定义 API Base URL（如 https://api.deepseek.com）
-  -c, --continue         自动接续当前工作区最近一次历史会话
-  -s, --session ID       指定要恢复的历史会话 ID
-  -v, --verbose          显示工具执行耗时、返回码等诊断信息
-  --help                 显示命令行帮助说明
+-w, --workspace PATH   工作区根目录，默认当前目录
+-p, --prompt TEXT      单次非交互执行任务后退出
+-m, --model MODEL      模型名称
+-b, --base-url URL     OpenAI-compatible API Base URL
+-c, --continue         恢复当前工作区最近一次会话
+-s, --session ID       恢复指定会话
+-v, --verbose          显示更多工具执行诊断信息
+--help                 显示帮助
 ```
 
-### 运行示例
+常见用法：
 
 ```bash
-# 启动并在当前工作区开启新会话（支持 Token 流式打字机输出）
+# 当前目录启动
 uv run mini-agent
 
-# 单次非交互模式：直接在终端执行任务并退出（适合自动化脚本）
-uv run mini-agent -p "运行单元测试并修复代码中的错误"
+# 分析另一个项目
+uv run mini-agent --workspace /path/to/project
 
-# 断点续聊：接上一次离开时的对话
+# 一次性任务
+uv run mini-agent -p "运行测试并解释失败原因"
+
+# 恢复最近会话
 uv run mini-agent --continue
-
-# 指定分析其他项目目录并使用 DeepSeek
-uv run mini-agent --workspace /path/to/my-project --model deepseek-chat
 ```
 
-### REPL 交互快捷指令
+## REPL 指令
 
 | 指令 | 说明 |
-| :--- | :--- |
-| **`/help`** | 显示指令与内置工具帮助说明 |
-| **`/provider [name]`** | 切换或查看大模型服务商预设（`deepseek`, `deepseek-r1`, `openai`, `ollama`, `qwen`, `siliconflow` 等） |
-| **`/diff`** | 查看当前工作区的所有 Git 代码改动（高亮彩色渲染） |
-| **`/commit [msg]`** | 智能分析改动生成 Conventional Commit 提交信息并自动提交 |
-| **`/sessions`** | 查看当前工作区的所有历史会话列表（ID、更新时间、轮数、摘要） |
-| **`/resume <id>`** | 切换并恢复指定历史会话 |
-| **`/new`** | 重置上下文，开启全新会话 |
-| **`/model [name]`** | 查看或临时切换当前模型（如 `/model deepseek-reasoner`） |
-| **`/clear`** | 清屏并置顶状态 Banner |
-| **`/exit, /quit`** | 优雅退出当前会话 |
+| --- | --- |
+| `/help` | 查看快捷指令和工具能力 |
+| `/provider [name]` | 查看或切换服务商预设 |
+| `/model [name]` | 查看或切换当前模型 |
+| `/cost` | 查看当前会话 Token 与预估费用 |
+| `/cost list` | 查看本地模型费率表 |
+| `/cost set <model> <input> <output>` | 自定义模型费率 |
+| `/diff` | 查看当前 Git diff |
+| `/commit [msg]` | 生成或执行 Git commit |
+| `/sessions` | 查看当前工作区历史会话 |
+| `/resume <id>` | 恢复指定会话 |
+| `/new` | 新建会话 |
+| `/clear` | 清屏 |
+| `/exit` / `/quit` | 退出 |
 
----
+## 工具安全边界
 
-## 项目自定义规则 (.agentrules / MINI_AGENT.md)
+### 工作区路径
 
-`mini-agent` 启动时会自动扫描并加载项目根目录下的规范文件（优先级：`.agentrules` → `MINI_AGENT.md` → `CLAUDE.md` → `.cursorrules`），并自动注入系统提示词中，使 Agent 严格遵循当前项目的技术选型、架构规范与代码风格约束。
+文件工具只接受工作区内相对路径。绝对路径、`..` 越界和指向工作区外部的符号链接会被拒绝。
 
----
+### 敏感文件
 
-## Agent 内置工具与限制
+Agent 的读取、代码搜索、写入和编辑路径会额外阻止常见凭据文件，例如：
 
-| 工具名称 | 输入参数 | 核心功能 | 限制与约束 |
-| :--- | :--- | :--- | :--- |
-| **`search_code`** | `pattern`, `path` (默认 `.`), `is_regex`, `case_sensitive` | 全文正则代码检索 | 递归检索工作区文本文件，自动忽略 `.git`、`.venv`、`node_modules` 等；返回匹配文件路径、行号与内容片段。 |
-| **`list_files`** | `path` (默认 `.`), `max_depth` (1~5) | 列出工作区目录与文件 | 自动忽略 `.git`、`.venv`、`__pycache__`；跳过越界符号链接；上限 500 项。 |
-| **`read_file`** | `path` (相对路径) | 读取文本文件内容 | 仅允许工作区内相对路径（拦截绝对路径与 `..` 越界）；仅读取 UTF-8 文本；单文件大小上限 100 KiB。 |
-| **`edit_file`** | `path`, `target_content`, `replacement_content` | 精准局部修改代码 | 必须在文件中唯一匹配 `target_content`，避免歧义替换；工作区相对路径沙箱。 |
-| **`write_file`** | `path`, `content` | 创建新文件或全量写入 | 工作区相对路径沙箱，自动创建父级目录。 |
-| **`run_shell`** | `command` (Shell 字符串) | 执行工作区受控 Shell 指令 | 拦截 `rm -rf`、`mkfs`、`sudo`、`cat /etc/passwd` 等高危命令；非白名单命令强制提示用户确认；超时（默认 30s）强杀进程组。 |
+- `.env` 和大多数 `.env.*` 文件
+- `.npmrc`、`.pypirc`、`.netrc`
+- `id_rsa`、`id_ed25519` 等私钥
+- `.pem`、`.key`、`.p12`、`.pfx`
+- `.aws/credentials`
+- `.docker/config.json`
+- Google Application Default Credentials
 
----
+`.env.example`、`.env.sample`、`.env.template` 和 `.env.dist` 等不含真实密钥的模板文件允许读取和编辑。
 
-## 安全声明与隐私策略
+这项策略用于降低凭据被发送到远程 LLM 上下文或被 Agent 意外改写的风险，但它不是通用 Secret Scanner，仍不应把真实密钥提交到项目目录中。
 
-> ⚠️ **重要安全提示**：
-> 1. `run_shell` 工具直接在本机工作区运行，**不是 OS 级的强安全沙箱**。
-> 2. 请勿在不可信的目录、存有明文核心私钥的目录或生产服务器环境直接运行本工具。
-> 3. 虽然工具层在执行子进程时已严格剥离 `OPENAI_API_KEY` 等敏感环境变量，但仍建议用户在执行非只读命令提示确认时仔细审阅命令内容。
+### Shell
 
----
+Shell 安全策略分为三层：
 
-## 自动化测试与代码质量
+1. 明确的破坏性/高风险模式直接阻断。
+2. 只有非常有限的简单只读命令可以自动执行，并且自动放行命令使用 `shell=False`。
+3. 管道、重定向、命令替换、换行组合以及其他非白名单命令都需要用户明确确认。
 
-本项目采用 100% 离线 Mock 机制，运行测试不需要配置真实 API Key 或访问外网：
+子进程环境还会过滤常见 API Key、云凭据和 Token 环境变量。
+
+即便如此，用户确认后的 Shell 命令仍然运行在宿主机上，因此不要把确认机制理解成 OS 级沙箱。
+
+## 项目规则文件
+
+启动时会查找项目规则文件，例如：
+
+- `.agentrules`
+- `MINI_AGENT.md`
+- `.mini_agent.md`
+- `CLAUDE.md`
+- `.cursorrules`
+
+这些文件会影响模型的项目级行为，因此在运行不熟悉的仓库前应先检查其内容。工具层权限检查独立于这些规则文件，不能由项目提示词绕过。
+
+## 测试与 CI
+
+本地质量检查：
 
 ```bash
-# 1. 运行所有单元测试 (pytest)
-uv run pytest
-
-# 2. 静态代码检查 (Ruff Lint)
 uv run ruff check .
-
-# 3. 代码格式化检查 (Ruff Format)
 uv run ruff format --check .
+uv run pytest
+uv build
 ```
 
----
+GitHub Actions 会在 Ubuntu、macOS 和 Windows 上分别执行 lint、格式检查、测试和构建，且 `fail-fast: false`，便于直接看到跨平台结果。
 
-## 项目代码结构
+CI 使用只读默认 `GITHUB_TOKEN` 权限，关键第三方 Actions 固定到具体 commit SHA。
+
+## Release
+
+仓库包含 tag 驱动的 Release workflow。推送 `v*` tag 后会先重新运行 Linux / macOS / Windows 测试门禁；只有全部通过才进入构建和 GitHub Release 创建步骤。
+
+Release workflow 还会检查：
+
+```text
+Git tag vX.Y.Z == pyproject.toml project.version X.Y.Z
+```
+
+因此不要在 CI 失败时手动发布正式 Release。
+
+## 项目结构
 
 ```text
 mini-agent/
-├── .env.example              # 环境变量模板（含 DeepSeek 配置示例）
-├── .gitignore                # Git 忽略规则
-├── README.md                 # 项目完整使用说明
-├── pyproject.toml            # 构建配置、依赖项与脚本入口
-├── uv.lock                   # 依赖精确锁定文件
-├── src/
-│   └── mini_agent/
-│       ├── __init__.py       # 包版本定义
-│       ├── main.py           # 控制台脚本入口 (mini-agent)
-│       ├── cli.py            # Typer CLI、REPL 循环与 Rich 界面
-│       ├── agent.py          # 核心 Agent Loop、History 管理与工具分发
-│       ├── llm.py            # LLMClient 协议、OpenAI & DeepSeek 兼容适配器
-│       ├── models.py         # Pydantic v2 数据契约与配置模型
-│       └── tools/
-│           ├── __init__.py   # 工具模块导出
-│           ├── filesystem.py # 安全相对路径解析、read_file 与 list_files
-│           └── shell.py      # 受控 run_shell、阻断/白名单与脱敏环境
-└── tests/
-    ├── __init__.py
-    ├── conftest.py           # pytest 配置与通用 Fixture
-    ├── test_smoke.py         # 导入冒烟测试
-    ├── test_filesystem.py    # 路径安全与文件工具测试 (21 项)
-    ├── test_shell.py         # 受控 Shell、环境脱敏与确认机制测试 (11 项)
-    ├── test_agent.py         # 基于 FakeLLM 的 Agent Loop 多步闭环测试 (11 项)
-    └── test_cli.py           # CLI 选项、异常退出与 REPL 交互测试 (8 项)
+├── .github/workflows/
+│   ├── ci.yml
+│   └── release.yml
+├── src/mini_agent/
+│   ├── agent.py
+│   ├── cli.py
+│   ├── context.py
+│   ├── cost.py
+│   ├── llm.py
+│   ├── models.py
+│   ├── providers.py
+│   ├── rules.py
+│   ├── session.py
+│   └── tools/
+│       ├── filesystem.py
+│       ├── secure_filesystem.py
+│       └── shell.py
+├── tests/
+├── pyproject.toml
+├── uv.lock
+└── README.md
 ```
+
+## 当前限制
+
+- 不是容器、VM 或内核级安全沙箱。
+- 项目规则文件属于不可信仓库输入，应在运行陌生仓库前检查。
+- 内置成本表是估算值；实际价格会随服务商、缓存命中和计费时段变化，可使用 `/cost set` 覆盖。
+- PyPI 发布版本可能晚于 GitHub 源码。
+
+## License
+
+MIT
