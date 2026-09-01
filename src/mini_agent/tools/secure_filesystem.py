@@ -18,7 +18,7 @@ from mini_agent.models import (
 from mini_agent.tools.filesystem import (
     BINARY_EXTENSIONS,
     IGNORED_NAMES,
-    list_files,
+    list_files as _list_files,
     resolve_relative_path,
     truncate_text,
 )
@@ -112,6 +112,19 @@ def _atomic_write_text(target: Path, content: str) -> None:
                 temp_path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def list_files(
+    input_data: ListFilesInput,
+    workspace_root: Path,
+    max_output_chars: int = 12_000,
+) -> ToolResult:
+    """List workspace files using the existing bounded directory traversal."""
+    return _list_files(
+        input_data,
+        workspace_root=workspace_root,
+        max_output_chars=max_output_chars,
+    )
 
 
 def read_file(
