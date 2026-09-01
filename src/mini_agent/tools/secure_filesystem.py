@@ -18,9 +18,11 @@ from mini_agent.models import (
 from mini_agent.tools.filesystem import (
     BINARY_EXTENSIONS,
     IGNORED_NAMES,
-    list_files as _list_files,
     resolve_relative_path,
     truncate_text,
+)
+from mini_agent.tools.filesystem import (
+    list_files as _list_files,
 )
 
 SAFE_ENV_TEMPLATE_NAMES = {
