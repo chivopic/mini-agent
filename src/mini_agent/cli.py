@@ -56,7 +56,7 @@ def render_banner(
     content = Text()
     content.append("✦ ", style="bold cyan")
     content.append("MINI-AGENT", style="bold white")
-    content.append("  v0.2.0\n", style="dim")
+    content.append("  v0.2.1\n", style="dim")
     content.append("📁 工作区: ", style="bold bright_black")
     content.append(f"{workspace.as_posix()}\n", style="white")
     content.append("⚡ 模型:   ", style="bold bright_black")
