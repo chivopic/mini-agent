@@ -23,25 +23,21 @@ class UsageStats(BaseModel):
         )
 
 
-# Built-in pricing per 1M tokens in CNY (RMB)
-# (Input price per 1M, Output price per 1M)
+# Built-in pricing per 1M tokens in CNY (RMB).
+# DeepSeek uses time-of-day and cache-dependent pricing. Because this estimator does not know
+# whether an input token was a cache hit, the built-ins intentionally use the current PEAK,
+# CACHE-MISS input rate plus the PEAK output rate as a conservative upper-bound estimate.
+# Users can override any model through ~/.mini-agent/pricing.json or MINI_AGENT_PRICING.
 BUILTIN_MODEL_PRICING_CNY: dict[str, tuple[float, float]] = {
-    # DeepSeek V4 Series (Latest)
-    "deepseek-v4-flash": (0.5, 1.0),
-    "deepseek-v4-pro": (2.0, 4.0),
-    "deepseek-v4-reasoner": (4.0, 16.0),
-    "deepseek-v4": (1.0, 2.0),
-    # DeepSeek V3 / R1 Legacy & Aliases
-    "deepseek-chat": (1.0, 2.0),
-    "deepseek-v3": (1.0, 2.0),
-    "deepseek-reasoner": (4.0, 16.0),
-    "deepseek-r1": (4.0, 16.0),
-    # OpenAI (USD converted to approx CNY @ 7.2)
+    # DeepSeek V4 Series (pricing effective 2026-08-16)
+    "deepseek-v4-flash": (3.0, 9.0),
+    "deepseek-v4-pro": (9.0, 27.0),
+    # OpenAI (USD converted to approx CNY @ 7.2; user-overridable estimates)
     "gpt-4o-mini": (1.08, 4.32),
     "gpt-4o": (18.0, 72.0),
     "o1-mini": (21.6, 86.4),
     "o1": (108.0, 432.0),
-    # Qwen (Aliyun Bailian)
+    # Qwen (Aliyun Bailian; user-overridable estimates)
     "qwen-turbo": (0.3, 0.6),
     "qwen-plus": (0.8, 2.0),
     "qwen-max": (20.0, 60.0),
@@ -84,7 +80,8 @@ def load_pricing_table(pricing_file: Path | None = None) -> dict[str, tuple[floa
         except Exception:
             pass
 
-    # 2. Load from environment variable MINI_AGENT_PRICING (e.g. "model1:1.0,2.0;model2:0.5,1.0")
+    # 2. Load from environment variable MINI_AGENT_PRICING
+    # e.g. "model1:1.0,2.0;model2:0.5,1.0"
     env_pricing = os.environ.get("MINI_AGENT_PRICING", "").strip()
     if env_pricing:
         for item in env_pricing.split(";"):
