@@ -418,9 +418,8 @@ def search_code(
             metadata=metadata,
         )
 
-    result_text = (
-        f"找到 {len(matches)} 处匹配代码 (已检索 {files_searched} 个文件):\n"
-        + "\n".join(f"- {match}" for match in matches)
+    result_text = f"找到 {len(matches)} 处匹配代码 (已检索 {files_searched} 个文件):\n" + "\n".join(
+        f"- {match}" for match in matches
     )
     content, truncated = truncate_text(result_text, max_chars=max_output_chars)
     metadata["truncated"] = truncated
