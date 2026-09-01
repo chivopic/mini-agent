@@ -44,11 +44,9 @@ class TestCliCommands:
     def test_cli_help_flag(self) -> None:
         result = runner.invoke(app, ["--help"])
         assert result.exit_code == 0
-        # Typer/Rich may collapse or reflow individual option names depending on terminal width
-        # and version. Test stable user-facing help markers here; option behavior is covered by
-        # the functional CLI tests below.
+        # Typer/Rich may reflow individual option names depending on terminal width/version.
+        # Option behavior itself is covered by the functional CLI tests below.
         assert "mini-agent" in result.stdout.lower()
-        assert "--help" in result.stdout
 
     def test_cli_invalid_workspace(self, tmp_path: Path) -> None:
         non_existent = tmp_path / "not_found_dir"
@@ -95,7 +93,6 @@ class TestCliCommands:
         render_sessions_table(test_console, tmp_path)
         assert "暂无历史会话" in test_console.export_text()
 
-        # Save a session
         s = SessionData(
             meta=SessionMeta(
                 session_id="s_123",
