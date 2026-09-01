@@ -6,6 +6,16 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 
+DEEPSEEK_MODEL_ALIASES = {
+    "deepseek-v4": "deepseek-v4-flash",
+    "deepseek-v3": "deepseek-v4-flash",
+    "deepseek-chat": "deepseek-v4-flash",
+    "deepseek-v4-reasoner": "deepseek-v4-pro",
+    "deepseek-reasoner": "deepseek-v4-pro",
+    "deepseek-r1": "deepseek-v4-pro",
+}
+
+
 class AgentConfig(BaseModel):
     """Configuration for the agent and execution environment."""
 
@@ -15,7 +25,7 @@ class AgentConfig(BaseModel):
     )
     model: str = Field(
         default="gpt-4o-mini",
-        description="OpenAI model identifier to use.",
+        description="LLM model identifier to use.",
     )
     max_tool_rounds: int = Field(
         default=8,
@@ -42,6 +52,15 @@ class AgentConfig(BaseModel):
         if not path.is_dir():
             raise ValueError(f"Workspace path is not a directory: {path}")
         return path
+
+    @field_validator("model", mode="before")
+    @classmethod
+    def canonicalize_model_alias(cls, value: Any) -> Any:
+        """Map retired DeepSeek model IDs to currently supported V4 API IDs."""
+        if not isinstance(value, str):
+            return value
+        clean = value.strip()
+        return DEEPSEEK_MODEL_ALIASES.get(clean.lower(), clean)
 
 
 class ToolResult(BaseModel):
